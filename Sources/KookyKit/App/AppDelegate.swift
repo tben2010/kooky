@@ -128,6 +128,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         settings.onThemeAppearanceChanged = { [weak self] in
             self?.refreshThemeAppearances()
         }
+        // The board lives app-wide but a card's agent tab lives in one
+        // window; "Show Agent Tab" needs the cross-window reveal only the
+        // delegate can do (front the right window, then activate).
+        KanbanStore.shared.revealSession = { [weak self] sessionId in
+            self?.revealSessionForKanban(sessionId)
+        }
         systemAppearanceObservation = NSApp.observe(
             \.effectiveAppearance,
             options: [.new]
@@ -410,6 +416,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
               let hit = dockTabLocation(for: id)
         else { return }
         NSApp.activate(ignoringOtherApps: true)
+        revealTab(hit.session, in: hit.workspace, controller: hit.controller)
+    }
+
+    /// Kanban card → its agent tab. Same reveal as the Dock jump, plus the
+    /// owning window flips back from the board to the terminals so the tab
+    /// is actually visible after the jump.
+    private func revealSessionForKanban(_ sessionId: UUID) {
+        guard let hit = dockTabLocation(for: sessionId) else { return }
+        withAnimation(Theme.chromeTransition) {
+            hit.controller.store.setMainContent(.terminals)
+        }
         revealTab(hit.session, in: hit.workspace, controller: hit.controller)
     }
 
@@ -822,6 +839,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             workspace: workspace,
             isRead: visible
         )
+        // A Kanban card's agent exiting is the board's "hand it back to the
+        // human" signal: In Progress → In Review. Fallback for agents that
+        // never call `kooky-cli card done`; a no-op for any other column.
+        if kind == .completed,
+           let card = KanbanStore.shared.card(launchedSession: sessionId),
+           card.column == .inProgress {
+            KanbanStore.shared.move(card.id, to: .inReview)
+        }
         // System banner: attention / failure only, gated on the setting + its
         // sub-toggle + visibility. Completed is inbox-only (never a banner).
         let settings = KookySettingsModel.shared
@@ -1033,6 +1058,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         for controller in windowControllers {
             controller.store.flushPersistence()
         }
+        KanbanStore.shared.flush()
         // If closed-lid mode is engaged, re-enable lid sleep before dying —
         // a system-wide pmset flag outlives the process, unlike assertions.
         SleepGuard.shared.shutdownCleanup()
@@ -1136,6 +1162,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
         let viewEntries: [MenuEntry] = [
             selfRow("Toggle Sidebar", #selector(handleToggleSidebar), "s", modifiers: [.command, .control]),
+            selfRow("Kanban Board", #selector(handleToggleKanban), "k", modifiers: [.command, .shift]),
             .separator,
             selfRow("Increase Font Size", #selector(handleIncreaseFontSize), "="),
             selfRow("Decrease Font Size", #selector(handleDecreaseFontSize), "-"),
@@ -1432,6 +1459,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             handleNewSSHWorkspace()
         case .openRecentFolder(let path):
             openRecentFolder(atPath: path)
+        case .kanbanBoard:
+            guard let store = activeStore else { return }
+            withAnimation(Theme.chromeTransition) {
+                store.setMainContent(.kanban)
+            }
         }
     }
 
@@ -1695,6 +1727,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         guard let store = activeStore else { return }
         withAnimation(Theme.chromeTransition) {
             store.setSidebarMode(store.sidebarMode.next)
+        }
+    }
+
+    @objc private func handleToggleKanban() {
+        guard let store = activeStore else { return }
+        withAnimation(Theme.chromeTransition) {
+            store.setMainContent(store.mainContent == .kanban ? .terminals : .kanban)
         }
     }
 

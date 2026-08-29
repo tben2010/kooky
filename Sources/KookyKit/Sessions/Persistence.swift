@@ -15,6 +15,9 @@ struct PersistedState: Codable, Equatable {
     /// Optional so state.json files written before the History pane existed
     /// still decode (nil → `.agents`).
     var rightSidebarContent: RightSidebarContent?
+    /// Optional so state.json files written before the Kanban board existed
+    /// still decode (nil → `.terminals`).
+    var mainContent: MainContent?
     /// Optional so pre-resizable-sidebar state files decode (nil → the
     /// design width). Clamped on restore, not trusted from disk.
     var sidebarWidth: Double?

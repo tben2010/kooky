@@ -72,6 +72,17 @@ struct ContentView: View {
             // A smaller tree only relaxes the future resize limit.
             onWindowLayoutChange(true, false)
         }
+        .onChange(of: store.mainContent, initial: true) { _, content in
+            // The host stays mounted either way (see `mainPane`); hiding it
+            // stops it drawing under the board AND makes AppKit drop the
+            // terminal as first responder, so typing on the board can't
+            // land in a hidden shell. Coming back, hand focus to the active
+            // terminal again — nothing else re-runs that grab.
+            paneHost.isHidden = content == .kanban
+            if content == .terminals {
+                paneHost.focusActiveTerminal()
+            }
+        }
     }
     /// Top chrome strip. `window.isMovable = false` is set globally, so the
     /// `WindowDragHandle` background is the only place AppKit allows
@@ -108,6 +119,19 @@ struct ContentView: View {
                     }
                 }
             HStack(spacing: Theme.chromeControlSpacing) {
+                HoverableIconButton(
+                    systemName: "rectangle.split.3x1",
+                    fontSize: 12,
+                    size: Theme.chromeToolbarButtonSize,
+                    help: store.mainContent == .kanban
+                        ? String(localized: "Back to Terminals", bundle: .kookyResources)
+                        : String(localized: "Kanban Board", bundle: .kookyResources)
+                ) {
+                    withAnimation(Theme.chromeTransition) {
+                        store.setMainContent(store.mainContent == .kanban ? .terminals : .kanban)
+                    }
+                }
+                .foregroundStyle(store.mainContent == .kanban ? Theme.chromeForeground : Theme.chromeMuted)
                 OpenInButton(store: store)
                 HoverableIconButton(
                     systemName: "sidebar.right",
@@ -130,12 +154,20 @@ struct ContentView: View {
     }
 
     private var mainPane: some View {
-        // No `.id`, no conditional: the host view is permanent and handles
-        // "no workspace" itself. The old `.id(workspace.id)` teardown/rebuild
-        // per switch was the root of the mount-churn bug class (issues #8,
-        // #24, workspace-switch flicker) — the AppKit host switches by
-        // visibility instead.
-        PaneTreeHostRepresentable(host: paneHost)
+        // No `.id`, no conditional AROUND THE HOST: the host view is
+        // permanent and handles "no workspace" itself. The old
+        // `.id(workspace.id)` teardown/rebuild per switch was the root of
+        // the mount-churn bug class (issues #8, #24, workspace-switch
+        // flicker) — the AppKit host switches by visibility instead. The
+        // Kanban board is a sibling overlay for the same reason: it comes
+        // and goes, the host never does.
+        ZStack {
+            PaneTreeHostRepresentable(host: paneHost)
+            if store.mainContent == .kanban {
+                KanbanBoardView(store: store)
+                    .transition(.opacity)
+            }
+        }
     }
 
     private var chromeBackground: Color {

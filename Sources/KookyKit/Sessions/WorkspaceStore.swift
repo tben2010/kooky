@@ -113,6 +113,15 @@ enum RightSidebarContent: String, Codable, Equatable, Sendable, CaseIterable {
     case info
 }
 
+/// What the window's main area shows — the terminal pane tree or the
+/// Kanban board. The pane-tree host stays mounted in both cases (see
+/// `ContentView.mainPane`); `.kanban` only overlays the board and hides
+/// the host, so every running session keeps its PTY.
+enum MainContent: String, Codable, Equatable, Sendable {
+    case terminals
+    case kanban
+}
+
 @MainActor
 @Observable
 final class WorkspaceStore {
@@ -135,6 +144,10 @@ final class WorkspaceStore {
     /// session information.
     /// Persisted like `sidebarContent`; the panel's own footer toggle flips it.
     var rightSidebarContent: RightSidebarContent = .agents
+    /// Main-area content — terminals or the Kanban board. Per window,
+    /// persisted like `sidebarContent`; the board's cards themselves live in
+    /// the app-wide `KanbanStore`.
+    var mainContent: MainContent = .terminals
     /// History pane's agent filter + search text. Runtime-only, but owned by
     /// the STORE, not the view: collapsing the panel (or cycling its mode)
     /// unmounts `SessionHistoryView`, and `@State` there would reset both to
@@ -311,6 +324,15 @@ final class WorkspaceStore {
         scheduleSave()
     }
 
+    /// Swap between the terminal tree and the Kanban board. Content-only:
+    /// the board overlays the (still mounted) pane host, so no
+    /// size-propagation suspension is needed.
+    func setMainContent(_ content: MainContent) {
+        guard mainContent != content else { return }
+        mainContent = content
+        scheduleSave()
+    }
+
     /// Content-only swap — the sidebar keeps its width, so no size-propagation
     /// suspension is needed (that dance is for width-animating mode changes).
     func setSidebarContent(_ content: SidebarContent) {
@@ -473,6 +495,22 @@ final class WorkspaceStore {
         workspaces.first { $0.id == activeWorkspaceId }
     }
 
+    /// Locates a session in this store or any peer window's store. The
+    /// Kanban board reads a card's live agent state through this: cards are
+    /// app-wide, but the tab a card launched may live in another window.
+    func locateSession(_ sessionId: UUID) -> (store: WorkspaceStore, workspace: Workspace, session: Session)? {
+        let candidates = [self] + peerStores().filter { $0 !== self }
+        for store in candidates {
+            for workspace in store.workspaces {
+                if let pane = workspace.root.pane(containingSessionId: sessionId),
+                   let session = pane.tabs.first(where: { $0.id == sessionId }) {
+                    return (store, workspace, session)
+                }
+            }
+        }
+        return nil
+    }
+
     init(
         persistence: any Persistence,
         engineFactory: @escaping @MainActor () -> any TerminalEngine = { LibghosttyEngine() },
@@ -511,6 +549,8 @@ final class WorkspaceStore {
         forceResume: Bool = false,
         rawLaunchCommand: String? = nil,
         customTitle: String? = nil,
+        initialPrompt: String? = nil,
+        extraOptions: String? = nil,
         activate: Bool = true,
         spawnInBackground: Bool = false
     ) -> Workspace {
@@ -547,9 +587,11 @@ final class WorkspaceStore {
             initialCwd: dir,
             conversationId: conversationId,
             forceResume: forceResume,
+            initialPrompt: initialPrompt,
             sshRemoteHost: workspace.sshRemoteHost,
             rawLaunchCommand: rawLaunchCommand,
             customTitle: customTitle,
+            extraOptions: extraOptions,
             spawnInBackground: spawnInBackground
         )
         wireSessionCallbacks(engine: session.engine, session: session, workspace: workspace, codexRolloutId: session.resumedConversationId)
@@ -600,29 +642,16 @@ final class WorkspaceStore {
     ) async -> CreateWorktreeSheet.CreateOutcome {
         switch request.kind {
         case .create(let mode, let path, let branchForDisplay):
-            // repoRoot runs inside the detached task too — it is a git
-            // subprocess with a 2s timeout, and on the main actor it froze
-            // the UI for that long on slow/network filesystems.
-            let sourceDir = source.workingDirectory
-            let failureMessage: String? = await Task.detached(priority: .userInitiated) {
-                guard let repoPath = WorktreeManager.repoRoot(near: sourceDir) else {
-                    return "not inside a git repository"
-                }
-                if case .failure(let err) = WorktreeManager.add(repoPath: repoPath, path: path, mode: mode) {
-                    return err.description
-                }
-                return nil
-            }.value
-            if let failureMessage {
-                return .failure(failureMessage)
-            }
-            addWorkspace(
-                workingDirectory: path,
-                worktreeParent: source,
-                worktreeBranch: branchForDisplay,
+            switch await createWorktreeWorkspace(
+                source: source,
+                mode: mode,
+                path: path,
+                branchForDisplay: branchForDisplay,
                 template: request.template
-            )
-            return .success
+            ) {
+            case .success: return .success
+            case .failure(let error): return .failure(error.message)
+            }
         case .adopt(let worktrees):
             // Pure sidebar materialization — no git command, the
             // directories already exist on disk. One workspace per
@@ -638,6 +667,54 @@ final class WorkspaceStore {
             }
             return .success
         }
+    }
+
+    /// Failure carrier for `createWorktreeWorkspace` — the git stderr (or a
+    /// kooky-side reason) the caller surfaces inline.
+    struct WorktreeCreationError: Error, Equatable {
+        let message: String
+    }
+
+    /// Runs `git worktree add` for `source` and materializes the resulting
+    /// directory as a child workspace, returning it so programmatic callers
+    /// (the Kanban board) can correlate the new workspace with what asked
+    /// for it. `initialPrompt` / `extraOptions` seed the workspace's first
+    /// tab — a card launches its agent with the card text in one spawn, not
+    /// a default shell plus a second tab.
+    func createWorktreeWorkspace(
+        source: Workspace,
+        mode: WorktreeManager.BranchMode,
+        path: URL,
+        branchForDisplay: String,
+        template: AgentTemplate,
+        initialPrompt: String? = nil,
+        extraOptions: String? = nil
+    ) async -> Result<Workspace, WorktreeCreationError> {
+        // repoRoot runs inside the detached task too — it is a git
+        // subprocess with a 2s timeout, and on the main actor it froze
+        // the UI for that long on slow/network filesystems.
+        let sourceDir = source.workingDirectory
+        let failureMessage: String? = await Task.detached(priority: .userInitiated) {
+            guard let repoPath = WorktreeManager.repoRoot(near: sourceDir) else {
+                return "not inside a git repository"
+            }
+            if case .failure(let err) = WorktreeManager.add(repoPath: repoPath, path: path, mode: mode) {
+                return err.description
+            }
+            return nil
+        }.value
+        if let failureMessage {
+            return .failure(WorktreeCreationError(message: failureMessage))
+        }
+        let workspace = addWorkspace(
+            workingDirectory: path,
+            worktreeParent: source,
+            worktreeBranch: branchForDisplay,
+            template: template,
+            initialPrompt: initialPrompt,
+            extraOptions: extraOptions
+        )
+        return .success(workspace)
     }
 
     /// Worktree workspaces close through this request first so the
@@ -1052,6 +1129,7 @@ final class WorkspaceStore {
         initialPrompt: String? = nil,
         rawLaunchCommand: String? = nil,
         customTitle: String? = nil,
+        extraOptions: String? = nil,
         activate: Bool = true,
         spawnInBackground: Bool = false
     ) -> Session {
@@ -1073,7 +1151,7 @@ final class WorkspaceStore {
         let cwd = initialCwd
             ?? template.extraCwd.map { resolvedSpawnCwd(($0 as NSString).expandingTildeInPath) }
             ?? workspace.workingDirectory
-        let session = spawnSession(template: template, initialCwd: cwd, conversationId: conversationId, forceResume: forceResume, initialPrompt: initialPrompt, sshRemoteHost: workspace.sshRemoteHost, rawLaunchCommand: rawLaunchCommand, customTitle: customTitle, spawnInBackground: spawnInBackground)
+        let session = spawnSession(template: template, initialCwd: cwd, conversationId: conversationId, forceResume: forceResume, initialPrompt: initialPrompt, sshRemoteHost: workspace.sshRemoteHost, rawLaunchCommand: rawLaunchCommand, customTitle: customTitle, extraOptions: extraOptions, spawnInBackground: spawnInBackground)
         wireSessionCallbacks(engine: session.engine, session: session, workspace: workspace, codexRolloutId: session.resumedConversationId)
         target.tabs.append(session)
         // `activate: false` (CLI --no-focus) appends WITHOUT touching the
@@ -1975,6 +2053,7 @@ final class WorkspaceStore {
         rightSidebarMode = state.rightSidebarMode ?? .hidden
         sidebarContent = state.sidebarContent ?? .workspaces
         rightSidebarContent = state.rightSidebarContent ?? .agents
+        mainContent = state.mainContent ?? .terminals
         sidebarWidth = state.sidebarWidth
             .map { SidebarView.clampWidth(CGFloat($0)) }
             ?? SidebarView.fullWidth
@@ -2022,12 +2101,19 @@ final class WorkspaceStore {
     /// Spawns the engine + Session. Caller wires `onPwdChange` / `onFocus`
     /// after a workspace ref is available — `restore` builds sessions before
     /// the workspace exists, so callbacks can't capture it here.
-    private func spawnSession(template: AgentTemplate, initialCwd: URL, sessionId: UUID = UUID(), conversationId: String? = nil, forceResume: Bool = false, initialPrompt: String? = nil, sshRemoteHost: String? = nil, rawLaunchCommand: String? = nil, customTitle: String? = nil, spawnInBackground: Bool = false) -> Session {
+    private func spawnSession(template: AgentTemplate, initialCwd: URL, sessionId: UUID = UUID(), conversationId: String? = nil, forceResume: Bool = false, initialPrompt: String? = nil, sshRemoteHost: String? = nil, rawLaunchCommand: String? = nil, customTitle: String? = nil, extraOptions callerOptions: String? = nil, spawnInBackground: Bool = false) -> Session {
         let engine = engineFactory()
         // Before `engine.start` (and before any view mounts): the flag is
         // what lets the surface come up under a hidden mount (issue #59).
         engine.spawnsWhileHidden = spawnInBackground
-        let extraOptions = optionsProvider(template.id)
+        // Per-launch options (a Kanban card's `--model …`) ride AFTER the
+        // user's global per-agent options so a card can override them —
+        // most CLIs honour the last occurrence of a repeated flag.
+        let mergedOptions = [optionsProvider(template.id), callerOptions]
+            .compactMap { $0?.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        let extraOptions = mergedOptions.isEmpty ? nil : mergedOptions
         let persistsConversation = template.persistsConversation(extraOptions: extraOptions)
         // Resume gated by user setting — `resumeConversations` flips this off
         // when the user wants every agent tab to start fresh without
@@ -2677,6 +2763,7 @@ final class WorkspaceStore {
             rightSidebarMode: rightSidebarMode,
             sidebarContent: sidebarContent,
             rightSidebarContent: rightSidebarContent,
+            mainContent: mainContent,
             sidebarWidth: Double(sidebarWidth),
             rightSidebarWidth: Double(rightSidebarWidth),
             collapsedInfoSections: collapsedInfoSections.isEmpty

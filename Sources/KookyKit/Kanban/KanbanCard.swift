@@ -1,0 +1,231 @@
+import Foundation
+
+/// Board columns in display order. Raw values are the on-disk spelling in
+/// `board.json` — rename a case, keep its raw value.
+enum KanbanColumn: String, Codable, CaseIterable, Sendable {
+    case backlog
+    case ready
+    case inProgress
+    case inReview
+    case done
+
+    /// Column heading. English inline is the localization key (the repo
+    /// convention — only zh-Hans overrides live in Localizable.strings).
+    @MainActor
+    var title: String {
+        let key: String
+        switch self {
+        case .backlog: key = "Backlog"
+        case .ready: key = "Ready"
+        case .inProgress: key = "In Progress"
+        case .inReview: key = "In Review"
+        case .done: key = "Done"
+        }
+        return String(localized: String.LocalizationValue(key), bundle: .kookyResources)
+    }
+
+    /// Terminal-state flag: a card here is neither editable-by-default nor
+    /// launchable — the sidebar equivalent of "archived".
+    var isTerminal: Bool { self == .done }
+}
+
+/// One line of the card's audit trail: column moves, launches, failures.
+/// Kept small on purpose — it's shown in the editor's footer, not a log
+/// viewer. Capped by `KanbanCard.eventCap`.
+struct KanbanEvent: Codable, Equatable, Identifiable, Sendable {
+    var id = UUID()
+    var timestamp: Date
+    var message: String
+}
+
+/// A feature card. Cards are app-wide (one board across every window) and
+/// belong to a git repository via `projectRoot` rather than a workspace id:
+/// workspace ids are per-window and die with the sidebar entry, the repo
+/// path outlives both.
+///
+/// The `launch*` fields are the runtime correlation to what "In Progress"
+/// created — cleared when the card leaves that column so a relaunch starts
+/// clean. `worktreePath` deliberately survives: a card moved back to
+/// Backlog keeps its worktree, and the next launch adopts it instead of
+/// failing on "branch already checked out".
+struct KanbanCard: Codable, Equatable, Identifiable, Sendable {
+    static let eventCap = 50
+
+    var id = UUID()
+    var title: String
+    /// Requirement description, Markdown. The agent gets it verbatim.
+    var requirement: String
+    /// One criterion per element; the editor edits them as lines.
+    var acceptanceCriteria: [String]
+    var column: KanbanColumn
+    /// Repo root (standardized) the card belongs to.
+    var projectRoot: URL
+    /// `AgentTemplate.id` of the agent that runs the card.
+    var agentId: String
+    /// Model override handed to the agent as an option (Phase 2 wires the
+    /// per-agent flag); nil = the agent's default.
+    var model: String?
+    /// Slash-command skill prefixed to the prompt (`/develop …`); nil = none.
+    var skill: String?
+    /// Branch the worktree checks out. Suggested from the title, editable.
+    var branchName: String
+    /// Pinned at first launch — mirrors `Workspace.worktreePath`.
+    var worktreePath: URL?
+    var launchedWorkspaceId: UUID?
+    var launchedSessionId: UUID?
+    /// Agent conversation id captured from the launched session so a
+    /// relaunch can resume rather than restart (Phase 2).
+    var conversationId: String?
+    var events: [KanbanEvent]
+    var createdAt: Date
+    var updatedAt: Date
+
+    init(
+        id: UUID = UUID(),
+        title: String = "",
+        requirement: String = "",
+        acceptanceCriteria: [String] = [],
+        column: KanbanColumn = .backlog,
+        projectRoot: URL,
+        agentId: String,
+        model: String? = nil,
+        skill: String? = nil,
+        branchName: String? = nil,
+        now: Date = Date()
+    ) {
+        self.id = id
+        self.title = title
+        self.requirement = requirement
+        self.acceptanceCriteria = acceptanceCriteria
+        self.column = column
+        self.projectRoot = projectRoot.standardizedFileURL
+        self.agentId = agentId
+        self.model = model
+        self.skill = skill
+        self.branchName = branchName ?? Self.suggestedBranchName(for: title)
+        self.events = []
+        self.createdAt = now
+        self.updatedAt = now
+    }
+
+    // MARK: Derived
+
+    /// `feature/<slug>` from the title — lowercase, ASCII-folded, dashes
+    /// for anything git or a shell would trip on. Empty title → empty slug
+    /// so the editor's validation (not a silent `feature/`) catches it.
+    static func suggestedBranchName(for title: String) -> String {
+        let folded = title
+            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .init(identifier: "en"))
+            .lowercased()
+        var slug = ""
+        var pendingDash = false
+        for scalar in folded.unicodeScalars {
+            let isWordChar = (scalar.value >= 0x61 && scalar.value <= 0x7A)   // a-z
+                || (scalar.value >= 0x30 && scalar.value <= 0x39)             // 0-9
+            if isWordChar {
+                if pendingDash, !slug.isEmpty { slug.append("-") }
+                pendingDash = false
+                slug.unicodeScalars.append(scalar)
+            } else {
+                pendingDash = true
+            }
+        }
+        guard !slug.isEmpty else { return "" }
+        return "feature/\(slug.prefix(48))"
+    }
+
+    /// Non-empty criteria only — blank lines in the editor don't count.
+    var effectiveCriteria: [String] {
+        acceptanceCriteria
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// Why this card can't move to Ready (or launch) yet. Empty = ready.
+    /// Strings are localization keys like every other user-facing string.
+    var readinessIssues: [String] {
+        var issues: [String] = []
+        if title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            issues.append("title is empty")
+        }
+        if requirement.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            issues.append("requirement is empty")
+        }
+        if effectiveCriteria.isEmpty {
+            issues.append("no acceptance criteria")
+        }
+        if agentId.isEmpty {
+            issues.append("no agent selected")
+        }
+        if !Self.isValidBranchName(branchName) {
+            issues.append("branch name is invalid")
+        }
+        return issues
+    }
+
+    var isReady: Bool { readinessIssues.isEmpty }
+
+    /// A conservative subset of `git check-ref-format --branch`: no
+    /// whitespace, no `..`, no control/shell-hostile characters, doesn't
+    /// start or end with `/`, `.` or `-`.
+    static func isValidBranchName(_ name: String) -> Bool {
+        guard !name.isEmpty, name.count <= 200 else { return false }
+        if name.contains("..") || name.contains("@{") || name.hasSuffix(".lock") { return false }
+        let forbidden = CharacterSet.whitespacesAndNewlines
+            .union(.controlCharacters)
+            .union(CharacterSet(charactersIn: "~^:?*[\\'\"`$;&|<>()"))
+        if name.unicodeScalars.contains(where: { forbidden.contains($0) }) { return false }
+        let edges = CharacterSet(charactersIn: "/.-")
+        if let first = name.unicodeScalars.first, edges.contains(first) { return false }
+        if let last = name.unicodeScalars.last, edges.contains(last) { return false }
+        return true
+    }
+
+    /// The text the agent is launched with. `worktreePath` / `branch` are
+    /// passed in (not read from self) so the prompt describes the launch
+    /// that is actually happening, not a stale pin.
+    func promptText(worktreePath: URL, branch: String) -> String {
+        var lines: [String] = []
+        if let skill = skill?.trimmingCharacters(in: .whitespacesAndNewlines), !skill.isEmpty {
+            let slash = skill.hasPrefix("/") ? skill : "/\(skill)"
+            lines.append(slash)
+        }
+        lines.append("# Feature: \(title.trimmingCharacters(in: .whitespacesAndNewlines))")
+        lines.append("")
+        lines.append("## Requirement")
+        lines.append(requirement.trimmingCharacters(in: .whitespacesAndNewlines))
+        lines.append("")
+        lines.append("## Acceptance criteria")
+        for criterion in effectiveCriteria {
+            lines.append("- [ ] \(criterion)")
+        }
+        lines.append("")
+        lines.append("## Working agreement")
+        lines.append("You are working in the git worktree `\(worktreePath.path)` on branch `\(branch)`.")
+        lines.append("Stay inside this worktree. Commit completed steps with clear messages.")
+        lines.append("Do not merge into other branches.")
+        lines.append("When every acceptance criterion is met, run: `kooky-cli card done \(id.uuidString)`")
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: Mutation helpers
+
+    mutating func touch(now: Date = Date()) {
+        updatedAt = now
+    }
+
+    mutating func record(_ message: String, now: Date = Date()) {
+        events.append(KanbanEvent(timestamp: now, message: message))
+        if events.count > Self.eventCap {
+            events.removeFirst(events.count - Self.eventCap)
+        }
+        touch(now: now)
+    }
+
+    /// Forget the launched tab/workspace but keep the worktree pin — see
+    /// the type doc for why.
+    mutating func clearLaunchLinks() {
+        launchedWorkspaceId = nil
+        launchedSessionId = nil
+    }
+}

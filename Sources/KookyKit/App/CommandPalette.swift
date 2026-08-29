@@ -60,6 +60,8 @@ enum PaletteItemKind: Hashable, Sendable {
     /// Open a recently used project folder as a new workspace in the
     /// active window (issue #28 — "pick from my projects" without ⌘O).
     case openRecentFolder(path: String)
+    /// Show the Kanban board in the active window.
+    case kanbanBoard
 }
 
 struct PaletteItem: Identifiable, Hashable {
@@ -154,6 +156,14 @@ enum PaletteIndex {
             subtitle: String(localized: "workspace on a remote host", bundle: bundle),
             kind: .createSSHWorkspace,
             symbol: "network",
+            iconAsset: nil
+        ))
+        items.append(PaletteItem(
+            id: "kanban-board",
+            title: String(localized: "Kanban Board", bundle: bundle),
+            subtitle: String(localized: "feature cards → worktree + agent", bundle: bundle),
+            kind: .kanbanBoard,
+            symbol: "rectangle.split.3x1",
             iconAsset: nil
         ))
         // Recent project folders — skip ones already open as a workspace
