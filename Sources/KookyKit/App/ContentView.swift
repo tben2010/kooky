@@ -78,8 +78,8 @@ struct ContentView: View {
             // terminal as first responder, so typing on the board can't
             // land in a hidden shell. Coming back, hand focus to the active
             // terminal again — nothing else re-runs that grab.
-            paneHost.isHidden = content == .kanban
-            if content == .terminals {
+            paneHost.isHidden = !content.showsTerminals
+            if content.showsTerminals {
                 paneHost.focusActiveTerminal()
             }
         }
@@ -123,15 +123,15 @@ struct ContentView: View {
                     systemName: "rectangle.split.3x1",
                     fontSize: 12,
                     size: Theme.chromeToolbarButtonSize,
-                    help: store.mainContent == .kanban
+                    help: store.mainContent.showsKanban
                         ? String(localized: "Back to Terminals", bundle: .kookyResources)
                         : String(localized: "Kanban Board", bundle: .kookyResources)
                 ) {
                     withAnimation(Theme.chromeTransition) {
-                        store.setMainContent(store.mainContent == .kanban ? .terminals : .kanban)
+                        store.toggleKanban()
                     }
                 }
-                .foregroundStyle(store.mainContent == .kanban ? Theme.chromeForeground : Theme.chromeMuted)
+                .foregroundStyle(store.mainContent.showsKanban ? Theme.chromeForeground : Theme.chromeMuted)
                 OpenInButton(store: store)
                 HoverableIconButton(
                     systemName: "sidebar.right",
@@ -161,13 +161,32 @@ struct ContentView: View {
         // flicker) — the AppKit host switches by visibility instead. The
         // Kanban board is a sibling overlay for the same reason: it comes
         // and goes, the host never does.
-        ZStack {
-            PaneTreeHostRepresentable(host: paneHost)
-            if store.mainContent == .kanban {
-                KanbanBoardView(store: store)
+        GeometryReader { proxy in
+            let split = store.mainContent == .kanbanSplit
+            let boardWidth = split ? Self.kanbanSplitWidth(for: proxy.size.width) : proxy.size.width
+            ZStack(alignment: .topLeading) {
+                // Split: the host is INSET, not re-parented — the same
+                // frame-only change a sidebar toggle makes.
+                PaneTreeHostRepresentable(host: paneHost)
+                    .padding(.leading, split ? boardWidth + 1 : 0)
+                if store.mainContent.showsKanban {
+                    HStack(spacing: 0) {
+                        KanbanBoardView(store: store)
+                            .frame(width: boardWidth)
+                        if split {
+                            Rectangle().fill(Theme.chromeSeparator).frame(width: 1)
+                        }
+                    }
                     .transition(.opacity)
+                }
             }
         }
+    }
+
+    /// Board share of a split main area: enough for five scrolling columns,
+    /// never so much that the terminal beside it turns into a sliver.
+    static func kanbanSplitWidth(for total: CGFloat) -> CGFloat {
+        min(max(total * 0.45, 420), max(420, total - 520))
     }
 
     private var chromeBackground: Color {

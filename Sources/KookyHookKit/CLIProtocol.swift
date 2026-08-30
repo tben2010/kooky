@@ -71,6 +71,9 @@ public enum KookyCLIVerb: String, Sendable {
     case close
     case status
     case rename
+    /// Kanban card round-trip from an agent tab: `--done` / `--note` /
+    /// `--show`. Additive verb — an older app answers "unknown verb".
+    case card
 }
 
 public struct KookyCLIRequest: Codable, Equatable, Sendable {
@@ -99,6 +102,17 @@ public struct KookyCLIRequest: Codable, Equatable, Sendable {
     /// activation, no window fronting, and the tab is not made its pane's
     /// active tab.
     public var noFocus: Bool?
+    /// `card`: one of `done` / `note` / `show`.
+    public var cardAction: String?
+    /// `card --id`: the card UUID. Optional — without it the app resolves
+    /// the card from `surface` (the tab the CLI was invoked in).
+    public var cardId: String?
+    /// `card --note`: free text appended to the card's history.
+    public var note: String?
+    /// `$KOOKY_SURFACE_ID` of the invoking tab, when the CLI runs inside
+    /// a kooky session. Lets an agent say `kooky-cli card --done` without
+    /// repeating the card id. Optional on the wire like every additive field.
+    public var surface: String?
 
     public init(
         verb: KookyCLIVerb,
@@ -108,7 +122,11 @@ public struct KookyCLIRequest: Codable, Equatable, Sendable {
         conversationId: String? = nil,
         tab: String? = nil,
         title: String? = nil,
-        noFocus: Bool? = nil
+        noFocus: Bool? = nil,
+        cardAction: String? = nil,
+        cardId: String? = nil,
+        note: String? = nil,
+        surface: String? = nil
     ) {
         self.kind = KookyCLIProtocol.kind
         self.protocolVersion = KookyCLIProtocol.version
@@ -120,6 +138,10 @@ public struct KookyCLIRequest: Codable, Equatable, Sendable {
         self.tab = tab
         self.title = title
         self.noFocus = noFocus
+        self.cardAction = cardAction
+        self.cardId = cardId
+        self.note = note
+        self.surface = surface
     }
 }
 

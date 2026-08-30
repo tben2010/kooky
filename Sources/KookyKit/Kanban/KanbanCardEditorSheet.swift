@@ -13,9 +13,17 @@ struct KanbanCardEditorSheet: View {
 
     @State private var draft: KanbanCard
     @State private var criteriaText: String
-    @State private var branchEditedManually: Bool
     @State private var modelText: String
     @State private var skillText: String
+    /// Discovered off-thread on appear; empty until then (and stays empty
+    /// for agents that don't speak slash commands).
+    @State private var skills: [KanbanSkill] = []
+    /// Model suggestions + configured default for the selected agent,
+    /// resolved off-thread whenever the agent changes.
+    @State private var modelInfo = KanbanModelSuggestions.Info(suggestions: [], defaultModel: nil)
+    /// Branches + worktrees of the card's repo, read off-thread on appear.
+    /// nil until loaded (or when the project isn't a git repo).
+    @State private var repoInfo: KanbanRepoInfo?
 
     private var bundle: Bundle { .kookyResources }
 
@@ -32,11 +40,6 @@ struct KanbanCardEditorSheet: View {
         self.dismiss = dismiss
         _draft = State(initialValue: card)
         _criteriaText = State(initialValue: card.acceptanceCriteria.joined(separator: "\n"))
-        // A branch that still equals the title-derived suggestion keeps
-        // following the title; anything else is the user's and stays.
-        _branchEditedManually = State(initialValue:
-            !card.title.isEmpty && card.branchName != KanbanCard.suggestedBranchName(for: card.title)
-        )
         _modelText = State(initialValue: card.model ?? "")
         _skillText = State(initialValue: card.skill ?? "")
     }
@@ -46,9 +49,94 @@ struct KanbanCardEditorSheet: View {
     }
 
     /// The card is launched already (or was): branch and project are
-    /// frozen — the worktree on disk carries them.
+    /// frozen — the worktree on disk (or the running tab) carries them.
     private var launchFieldsLocked: Bool {
-        draft.worktreePath != nil
+        draft.worktreePath != nil || draft.launchedSessionId != nil
+    }
+
+    private var featureBranchSuggestion: String {
+        KanbanCard.suggestedBranchName(for: draft.title)
+    }
+
+    /// One line under the branch field saying what a launch will do.
+    private var branchPlanHint: String? {
+        guard let repoInfo else { return nil }
+        let branch = draft.branchName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !branch.isEmpty else { return nil }
+        switch repoInfo.plan(for: branch) {
+        case .inPlace:
+            return String(localized: "current branch — the agent works in the repository itself, no worktree", bundle: bundle)
+        case .adoptWorktree(let path):
+            return String.localizedStringWithFormat(
+                String(localized: "already checked out in %@ — the agent works there", bundle: bundle),
+                (path.path as NSString).abbreviatingWithTildeInPath
+            )
+        case .worktreeOnExistingBranch:
+            return String(localized: "existing branch — a new worktree checks it out", bundle: bundle)
+        case .worktreeOnNewBranch:
+            return String.localizedStringWithFormat(
+                String(localized: "new branch from %@ — created in a new worktree", bundle: bundle),
+                repoInfo.currentBranch ?? "HEAD"
+            )
+        }
+    }
+
+    private var selectedTemplate: AgentTemplate? {
+        AgentTemplate.all.first { $0.id == draft.agentId }
+    }
+
+    private var modelSuggestions: [String] { modelInfo.suggestions }
+
+    /// "default" or "default (claude-fable-5)" — what a blank field means.
+    private var defaultModelLabel: String {
+        let base = String(localized: "default", bundle: bundle)
+        guard let configured = modelInfo.defaultModel else { return base }
+        return "\(base) (\(configured))"
+    }
+
+    /// Skills are Claude Code's dialect; other agents keep a plain field.
+    private var offersSkillPicker: Bool {
+        selectedTemplate?.rosterId == AgentTemplate.claudeCodeID
+    }
+
+    /// Menu row that marks the current value — so "none" / "default" read
+    /// as a state, not just an action.
+    private func choice(_ label: String, isSelected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            if isSelected {
+                Label(label, systemImage: "checkmark")
+            } else {
+                Text(label)
+            }
+        }
+    }
+
+    /// A field with an optional trailing menu of suggestions. The menu
+    /// only writes into the text — free text is always allowed.
+    private func suggestionField<Content: View>(
+        text: Binding<String>,
+        placeholder: String,
+        disabled: Bool = false,
+        @ViewBuilder menu: () -> Content
+    ) -> some View {
+        HStack(spacing: 6) {
+            TextField(placeholder, text: text)
+                .textFieldStyle(.plain)
+                .font(Theme.mono(12))
+                .disabled(disabled)
+            Menu {
+                menu()
+            } label: {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(Theme.chromeMuted)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+        }
+        .padding(8)
+        .bracketBorder()
     }
 
     var body: some View {
@@ -82,6 +170,30 @@ struct KanbanCardEditorSheet: View {
         .frame(width: 560, alignment: .topLeading)
         .background(Theme.chromeBackground)
         .preferredColorScheme(Theme.chromeColorScheme)
+        .task {
+            let root = draft.projectRoot
+            async let scanned = Task.detached(priority: .utility) {
+                KanbanSkillCatalog.scan(projectRoot: root)
+            }.value
+            async let repo = Task.detached(priority: .userInitiated) {
+                KanbanRepoInfo.load(projectRoot: root)
+            }.value
+            let loaded = await repo
+            repoInfo = loaded
+            // A fresh card starts on the main checkout's branch — "work on
+            // main" is the default, a feature branch is the `+` button.
+            if draft.branchName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !launchFieldsLocked {
+                draft.branchName = loaded.defaultBranch
+            }
+            skills = await scanned
+        }
+        .task(id: draft.agentId) {
+            let root = draft.projectRoot
+            let template = selectedTemplate
+            modelInfo = await Task.detached(priority: .utility) {
+                KanbanModelSuggestions.resolve(for: template, projectRoot: root)
+            }.value
+        }
     }
 
     // MARK: Sections
@@ -116,10 +228,6 @@ struct KanbanCardEditorSheet: View {
                     .font(Theme.mono(12))
                     .padding(8)
                     .bracketBorder()
-                    .onChange(of: draft.title) { _, title in
-                        guard !branchEditedManually, !launchFieldsLocked else { return }
-                        draft.branchName = KanbanCard.suggestedBranchName(for: title)
-                    }
             }
             field("requirement") {
                 editor($draft.requirement, minHeight: 110)
@@ -141,33 +249,94 @@ struct KanbanCardEditorSheet: View {
                     .labelsHidden()
                 }
                 field("model") {
-                    TextField(String(localized: "default", bundle: bundle), text: $modelText)
-                        .textFieldStyle(.plain)
-                        .font(Theme.mono(12))
-                        .padding(8)
-                        .bracketBorder()
+                    suggestionField(text: $modelText, placeholder: defaultModelLabel) {
+                        choice(defaultModelLabel, isSelected: modelText.isEmpty) { modelText = "" }
+                        if !modelSuggestions.isEmpty {
+                            Divider()
+                            ForEach(modelSuggestions, id: \.self) { model in
+                                choice(model, isSelected: modelText == model) { modelText = model }
+                            }
+                        }
+                        if selectedTemplate?.modelFlag == nil {
+                            Divider()
+                            Text(String(localized: "no model flag known for this agent", bundle: bundle))
+                        }
+                    }
                 }
                 field("skill") {
-                    TextField("/develop", text: $skillText)
-                        .textFieldStyle(.plain)
-                        .font(Theme.mono(12))
-                        .padding(8)
-                        .bracketBorder()
+                    suggestionField(text: $skillText, placeholder: String(localized: "none", bundle: bundle)) {
+                        choice(String(localized: "none", bundle: bundle), isSelected: skillText.isEmpty) { skillText = "" }
+                        if offersSkillPicker {
+                            ForEach(KanbanSkill.Scope.allCases, id: \.self) { scope in
+                                let group = skills.filter { $0.scope == scope }
+                                if !group.isEmpty {
+                                    Divider()
+                                    Section(String(localized: String.LocalizationValue(scope.rawValue), bundle: bundle)) {
+                                        ForEach(group) { skill in
+                                            let label = skill.description.isEmpty
+                                                ? skill.name
+                                                : "\(skill.name) — \(singleLine(skill.description).prefix(60))"
+                                            choice(label, isSelected: skillText == skill.name || skillText == "/\(skill.name)") {
+                                                skillText = skill.name
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if skills.isEmpty {
+                                Divider()
+                                Text(String(localized: "no skills found", bundle: bundle))
+                            }
+                        } else {
+                            Divider()
+                            Text(String(localized: "skills are a Claude Code feature", bundle: bundle))
+                        }
+                    }
                 }
             }
             field("branch") {
-                TextField("feature/…", text: $draft.branchName)
-                    .textFieldStyle(.plain)
-                    .font(Theme.mono(12))
-                    .padding(8)
-                    .bracketBorder()
-                    .disabled(launchFieldsLocked)
-                    .opacity(launchFieldsLocked ? 0.6 : 1)
-                    .onChange(of: draft.branchName) { _, value in
-                        if value != KanbanCard.suggestedBranchName(for: draft.title) {
-                            branchEditedManually = true
+                HStack(spacing: 8) {
+                    suggestionField(
+                        text: $draft.branchName,
+                        placeholder: repoInfo?.defaultBranch ?? "main",
+                        disabled: launchFieldsLocked
+                    ) {
+                        if let repoInfo {
+                            if let current = repoInfo.currentBranch {
+                                choice("\(current) — \(String(localized: "current", bundle: bundle))", isSelected: draft.branchName == current) {
+                                    draft.branchName = current
+                                }
+                                Divider()
+                            }
+                            ForEach(repoInfo.branches.filter { $0 != repoInfo.currentBranch }, id: \.self) { branch in
+                                let worktree = repoInfo.worktreePath(checkingOut: branch)
+                                choice(
+                                    worktree == nil ? branch : "\(branch) — \(String(localized: "in worktree", bundle: bundle))",
+                                    isSelected: draft.branchName == branch
+                                ) { draft.branchName = branch }
+                            }
+                        } else {
+                            Text(String(localized: "reading branches…", bundle: bundle))
                         }
                     }
+                    .opacity(launchFieldsLocked ? 0.6 : 1)
+                    // "+" = a feature branch for this card, `feature/<title-slug>`.
+                    // Still plain text afterwards — edit or pick another.
+                    BracketButton("+", localizesTitle: false) {
+                        draft.branchName = featureBranchSuggestion
+                    }
+                    .disabled(launchFieldsLocked || featureBranchSuggestion.isEmpty)
+                    .opacity(launchFieldsLocked || featureBranchSuggestion.isEmpty ? 0.4 : 1)
+                    .help(featureBranchSuggestion.isEmpty
+                          ? String(localized: "Enter a title first", bundle: bundle)
+                          : String.localizedStringWithFormat(String(localized: "Use feature branch %@", bundle: bundle), featureBranchSuggestion))
+                }
+                if let branchPlanHint {
+                    Text(branchPlanHint)
+                        .font(Theme.mono(10))
+                        .foregroundStyle(Theme.chromeMuted.opacity(0.8))
+                        .lineLimit(2)
+                }
             }
             if let worktree = draft.worktreePath {
                 field("worktree") {

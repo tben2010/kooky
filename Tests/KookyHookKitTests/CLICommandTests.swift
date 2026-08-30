@@ -409,4 +409,44 @@ final class CLICommandTests: XCTestCase {
         XCTAssertEqual(statusJSON["appVersion"] as? String, "1.2.3")
         XCTAssertEqual(statusJSON["cliProtocolVersion"] as? Int, KookyCLIProtocol.version)
     }
+
+    // MARK: card
+
+    func testParseCardDoneWithoutId() {
+        XCTAssertEqual(parsed(["card", "--done"]), .card(action: "done", id: nil, note: nil))
+    }
+
+    func testParseCardWithIdAndNote() {
+        let id = UUID().uuidString
+        XCTAssertEqual(
+            parsed(["card", "--note", "half way there", "--id", id]),
+            .card(action: "note", id: id, note: "half way there")
+        )
+        XCTAssertEqual(parsed(["card", "--show", "--id", id]), .card(action: "show", id: id, note: nil))
+    }
+
+    func testParseCardRejectsNoOrMultipleActions() {
+        XCTAssertNotNil(parseError(["card"]))
+        XCTAssertNotNil(parseError(["card", "--done", "--show"]))
+        XCTAssertNotNil(parseError(["card", "--id", "not-a-uuid", "--done"]))
+    }
+
+    func testCardRequestCarriesSurface() throws {
+        let request = try XCTUnwrap(KookyHookKit.cliRequest(for: .card(action: "done", id: nil, note: nil), surfaceId: "ABC"))
+        XCTAssertEqual(request.verb, "card")
+        XCTAssertEqual(request.cardAction, "done")
+        XCTAssertNil(request.cardId)
+        XCTAssertEqual(request.surface, "ABC")
+        // Older verbs never carry the new fields — byte-identical wire shape.
+        let open = try XCTUnwrap(KookyHookKit.cliRequest(for: .list(json: false), surfaceId: "ABC"))
+        XCTAssertNil(open.surface)
+        XCTAssertNil(open.cardAction)
+    }
+
+    func testCardVerbRoundTripsThroughDecoder() throws {
+        let request = KookyCLIRequest(verb: .card, cardAction: "note", cardId: "x", note: "hi", surface: "s")
+        let line = try XCTUnwrap(request.encodedLine())
+        let back = try XCTUnwrap(KookyCLIRequest.decode(from: line))
+        XCTAssertEqual(back, request)
+    }
 }

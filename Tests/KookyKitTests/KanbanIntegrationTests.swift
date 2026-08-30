@@ -63,6 +63,32 @@ final class KanbanIntegrationTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(persistence.saveCount, before)
     }
 
+    func testToggleKanbanRemembersSplitLayout() {
+        let persistence = InMemoryPersistence()
+        let store = makeStore(persistence: persistence)
+        store.toggleKanban()
+        XCTAssertEqual(store.mainContent, .kanban)
+        store.setMainContent(.kanbanSplit)
+        store.toggleKanban()
+        XCTAssertEqual(store.mainContent, .terminals)
+        store.toggleKanban()
+        XCTAssertEqual(store.mainContent, .kanbanSplit, "⌘⇧K returns to the layout the user last used")
+        store.flushPersistence()
+        XCTAssertEqual(persistence.saved?.mainContent, .kanbanSplit)
+        XCTAssertTrue(MainContent.kanbanSplit.showsTerminals)
+        XCTAssertTrue(MainContent.kanbanSplit.showsKanban)
+        XCTAssertFalse(MainContent.kanban.showsTerminals)
+        XCTAssertFalse(MainContent.terminals.showsKanban)
+    }
+
+    func testKanbanSplitWidthKeepsRoomForTheTerminal() {
+        XCTAssertEqual(ContentView.kanbanSplitWidth(for: 2000), 900)
+        XCTAssertEqual(ContentView.kanbanSplitWidth(for: 1000), 450, "45% while the terminal keeps ≥ 520pt")
+        XCTAssertEqual(ContentView.kanbanSplitWidth(for: 1100), 495)
+        XCTAssertEqual(ContentView.kanbanSplitWidth(for: 1300), 585)
+        XCTAssertEqual(ContentView.kanbanSplitWidth(for: 800), 420, "board never below its scrolling minimum")
+    }
+
     func testLegacyStateWithoutMainContentRestoresTerminals() {
         let persistence = InMemoryPersistence()
         let store = makeStore(persistence: persistence)
@@ -192,10 +218,13 @@ final class KanbanIntegrationTests: XCTestCase {
         XCTAssertEqual(workspace.worktreeBranch, "feature/kanban-launch")
         let session = try XCTUnwrap(workspace.activeSession)
         XCTAssertEqual(session.id, launched.launchedSessionId)
+        XCTAssertFalse((session.engine as? TestEngine)?.spawnsWhileHidden ?? true, "a visible, active tab — the reliable spawn path")
+        XCTAssertEqual(store.activeWorkspaceId, workspace.id, "the agent tab becomes the window's active one")
+        XCTAssertEqual(workspace.activeSession?.id, session.id)
         let command = try XCTUnwrap(launchCommand(of: session))
         XCTAssertTrue(command.hasPrefix("claude "), command)
         XCTAssertTrue(command.contains("Kanban launch"), command)
-        XCTAssertTrue(command.contains("kooky-cli card done \(card.id.uuidString)"), command)
+        XCTAssertTrue(command.contains("kooky-cli card --done --id \(card.id.uuidString)"), command)
         XCTAssertTrue(command.hasSuffix("--model opus"), command)
 
         // Second launch after a bounce: adopts the pinned worktree instead
@@ -208,6 +237,105 @@ final class KanbanIntegrationTests: XCTestCase {
         XCTAssertEqual(relaunched.worktreePath, worktreePath)
         XCTAssertNotEqual(relaunched.launchedSessionId, launched.launchedSessionId, "a fresh tab")
         XCTAssertEqual(relaunched.launchedWorkspaceId, launched.launchedWorkspaceId, "in the same worktree workspace")
+    }
+
+    func testLaunchOnCurrentBranchWorksInPlaceWithoutWorktree() async throws {
+        let repo = try makeGitRepo()
+        defer { try? FileManager.default.removeItem(at: repo.deletingLastPathComponent()) }
+        let store = makeStore()
+        let board = KanbanStore(persistence: InMemoryKanbanPersistence())
+        let card = KanbanCard(
+            title: "Fix on main",
+            requirement: "Small fix",
+            acceptanceCriteria: ["fixed"],
+            projectRoot: repo,
+            agentId: AgentTemplate.claudeCodeID,
+            branchName: "main"
+        )
+        board.add(card)
+        XCTAssertEqual(board.move(card.id, to: .inProgress), .needsLaunch)
+        let before = store.workspaces.count
+        let failure = await KanbanLaunchCoordinator.launch(cardId: card.id, board: board, store: store)
+        XCTAssertNil(failure)
+
+        let launched = try XCTUnwrap(board.card(id: card.id))
+        XCTAssertNil(launched.worktreePath, "in-place launch pins no worktree")
+        let workspace = try XCTUnwrap(store.workspaces.first { $0.id == launched.launchedWorkspaceId })
+        XCTAssertNil(workspace.worktreeParentId, "the tab lives in the repo's own workspace")
+        XCTAssertEqual(workspace.workingDirectory.standardizedFileURL.path, repo.path)
+        // sourceWorkspace created the repo workspace (the test store's seed is $HOME); no worktree child on top.
+        XCTAssertEqual(store.workspaces.count, before + 1)
+        let session = try XCTUnwrap(store.locateSession(launched.launchedSessionId!)?.session)
+        XCTAssertEqual(store.activeWorkspaceId, workspace.id)
+        XCTAssertEqual(workspace.activeSession?.id, session.id, "in-place tab is active in the repo workspace")
+        let command = try XCTUnwrap(launchCommand(of: session))
+        XCTAssertTrue(command.contains("working in the repository"), command)
+        XCTAssertTrue(command.contains("on branch `main`"), command)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: repo.deletingLastPathComponent().appendingPathComponent("repo-main").path))
+    }
+
+    func testLaunchOnExistingBranchChecksItOutInAWorktree() async throws {
+        let repo = try makeGitRepo()
+        defer { try? FileManager.default.removeItem(at: repo.deletingLastPathComponent()) }
+        try git(["branch", "release/1.0"], in: repo)
+        let store = makeStore()
+        let board = KanbanStore(persistence: InMemoryKanbanPersistence())
+        let card = KanbanCard(
+            title: "Hotfix",
+            requirement: "Patch",
+            acceptanceCriteria: ["patched"],
+            projectRoot: repo,
+            agentId: AgentTemplate.claudeCodeID,
+            branchName: "release/1.0"
+        )
+        board.add(card)
+        _ = board.move(card.id, to: .inProgress)
+        let failure = await KanbanLaunchCoordinator.launch(cardId: card.id, board: board, store: store)
+        XCTAssertNil(failure)
+        let launched = try XCTUnwrap(board.card(id: card.id))
+        let worktree = try XCTUnwrap(launched.worktreePath)
+        XCTAssertEqual(worktree.lastPathComponent, "repo-release-1.0")
+        let info = KanbanRepoInfo.load(projectRoot: repo)
+        XCTAssertEqual(info.worktreePath(checkingOut: "release/1.0")?.standardizedFileURL.path, worktree.standardizedFileURL.path)
+        XCTAssertEqual(info.branches.filter { $0 == "release/1.0" }.count, 1, "no duplicate branch was created")
+    }
+
+    func testRepoInfoPlans() throws {
+        let repo = try makeGitRepo()
+        defer { try? FileManager.default.removeItem(at: repo.deletingLastPathComponent()) }
+        try git(["branch", "feature/existing"], in: repo)
+        let info = KanbanRepoInfo.load(projectRoot: repo)
+        XCTAssertEqual(info.currentBranch, "main")
+        XCTAssertEqual(info.defaultBranch, "main")
+        XCTAssertEqual(info.plan(for: "main"), .inPlace)
+        XCTAssertEqual(info.plan(for: "feature/existing"), .worktreeOnExistingBranch)
+        XCTAssertEqual(info.plan(for: "feature/new"), .worktreeOnNewBranch)
+        let detached = KanbanRepoInfo(root: repo, currentBranch: nil, branches: ["dev", "master"], worktrees: [])
+        XCTAssertEqual(detached.defaultBranch, "master")
+        XCTAssertEqual(KanbanRepoInfo(root: repo, currentBranch: nil, branches: [], worktrees: []).defaultBranch, "main")
+    }
+
+    func testLaunchSwitchesACoveringBoardToSplit() async throws {
+        let repo = try makeGitRepo()
+        defer { try? FileManager.default.removeItem(at: repo.deletingLastPathComponent()) }
+        let store = makeStore()
+        let board = KanbanStore(persistence: InMemoryKanbanPersistence())
+        let card = KanbanCard(title: "Split me", requirement: "R", acceptanceCriteria: ["A"], projectRoot: repo, agentId: AgentTemplate.claudeCodeID, branchName: "main")
+        board.add(card)
+        _ = board.move(card.id, to: .inProgress)
+
+        store.setMainContent(.kanban)
+        let first = await KanbanLaunchCoordinator.launch(cardId: card.id, board: board, store: store)
+        XCTAssertNil(first)
+        XCTAssertEqual(store.mainContent, .kanbanSplit, "a board covering the host would keep the agent's surface from spawning")
+
+        // Launched from the terminals (e.g. `kooky-cli card --start`): no layout change.
+        _ = board.move(card.id, to: .backlog)
+        _ = board.move(card.id, to: .inProgress)
+        store.setMainContent(.terminals)
+        let second = await KanbanLaunchCoordinator.launch(cardId: card.id, board: board, store: store)
+        XCTAssertNil(second)
+        XCTAssertEqual(store.mainContent, .terminals)
     }
 
     func testLaunchFailureBouncesCardToReady() async throws {
@@ -238,6 +366,17 @@ final class KanbanIntegrationTests: XCTestCase {
     }
 
     // MARK: - Fixtures
+
+    private func git(_ args: [String], in repo: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", repo.path] + args
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0, "git \(args.joined(separator: " ")) failed")
+    }
 
     /// `<tmp>/<uuid>/repo` with one commit — `git worktree add` needs HEAD.
     private func makeGitRepo() throws -> URL {

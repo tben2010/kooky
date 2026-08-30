@@ -119,7 +119,14 @@ enum RightSidebarContent: String, Codable, Equatable, Sendable, CaseIterable {
 /// the host, so every running session keeps its PTY.
 enum MainContent: String, Codable, Equatable, Sendable {
     case terminals
+    /// Board covers the whole main area; the host is hidden.
     case kanban
+    /// Board on the left, the live pane tree on the right — the host stays
+    /// visible (inset), so an In Progress card's agent tab can be watched.
+    case kanbanSplit
+
+    var showsKanban: Bool { self != .terminals }
+    var showsTerminals: Bool { self != .kanban }
 }
 
 @MainActor
@@ -148,6 +155,10 @@ final class WorkspaceStore {
     /// persisted like `sidebarContent`; the board's cards themselves live in
     /// the app-wide `KanbanStore`.
     var mainContent: MainContent = .terminals
+    /// Which board layout ⌘⇧K comes back to — the split state is a
+    /// preference the user set inside the board, not something a plain
+    /// toggle should reset.
+    private var lastKanbanContent: MainContent = .kanban
     /// History pane's agent filter + search text. Runtime-only, but owned by
     /// the STORE, not the view: collapsing the panel (or cycling its mode)
     /// unmounts `SessionHistoryView`, and `@State` there would reset both to
@@ -329,8 +340,19 @@ final class WorkspaceStore {
     /// size-propagation suspension is needed.
     func setMainContent(_ content: MainContent) {
         guard mainContent != content else { return }
+        // Entering / leaving the split inset resizes every surface; suspend
+        // size propagation for the animation like a sidebar toggle does.
+        if mainContent == .kanbanSplit || content == .kanbanSplit {
+            suspendSizePropagationForLayoutAnimation(active?.root.allEngines ?? [])
+        }
         mainContent = content
+        if content.showsKanban { lastKanbanContent = content }
         scheduleSave()
+    }
+
+    /// ⌘⇧K / top-bar button: terminals ↔ the board in its last layout.
+    func toggleKanban() {
+        setMainContent(mainContent.showsKanban ? .terminals : lastKanbanContent)
     }
 
     /// Content-only swap — the sidebar keeps its width, so no size-propagation
@@ -688,7 +710,9 @@ final class WorkspaceStore {
         branchForDisplay: String,
         template: AgentTemplate,
         initialPrompt: String? = nil,
-        extraOptions: String? = nil
+        extraOptions: String? = nil,
+        activate: Bool = true,
+        spawnInBackground: Bool = false
     ) async -> Result<Workspace, WorktreeCreationError> {
         // repoRoot runs inside the detached task too — it is a git
         // subprocess with a 2s timeout, and on the main actor it froze
@@ -712,7 +736,9 @@ final class WorkspaceStore {
             worktreeBranch: branchForDisplay,
             template: template,
             initialPrompt: initialPrompt,
-            extraOptions: extraOptions
+            extraOptions: extraOptions,
+            activate: activate,
+            spawnInBackground: spawnInBackground
         )
         return .success(workspace)
     }
@@ -2054,6 +2080,7 @@ final class WorkspaceStore {
         sidebarContent = state.sidebarContent ?? .workspaces
         rightSidebarContent = state.rightSidebarContent ?? .agents
         mainContent = state.mainContent ?? .terminals
+        if mainContent.showsKanban { lastKanbanContent = mainContent }
         sidebarWidth = state.sidebarWidth
             .map { SidebarView.clampWidth(CGFloat($0)) }
             ?? SidebarView.fullWidth

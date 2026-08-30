@@ -128,6 +128,9 @@ final class KookyCLIController {
     /// presets. One roster serves both the lookup and the error hint, so
     /// the ids an error lists are exactly the ids the lookup accepts.
     private let templates: @MainActor () -> [AgentTemplate]
+    /// The Kanban board `card` verbs act on. Injected so tests drive an
+    /// isolated store; production resolves the shared one lazily.
+    private let board: @MainActor () -> KanbanStore
     private let resume: @MainActor (
         _ agentId: String,
         _ conversationId: String,
@@ -143,6 +146,7 @@ final class KookyCLIController {
         activateApp: @escaping @MainActor () -> Void,
         isShuttingDown: @escaping @MainActor () -> Bool = { false },
         templates: @escaping @MainActor () -> [AgentTemplate],
+        board: @escaping @MainActor () -> KanbanStore = { .shared },
         resume: @escaping @MainActor (
             _ agentId: String,
             _ conversationId: String,
@@ -157,6 +161,7 @@ final class KookyCLIController {
         self.activateApp = activateApp
         self.isShuttingDown = isShuttingDown
         self.templates = templates
+        self.board = board
         self.resume = resume
     }
 
@@ -194,7 +199,122 @@ final class KookyCLIController {
             handleOpen(request, isCallerWaiting: isCallerWaiting, completion: completion)
         case .resume:
             handleResume(request, isCallerWaiting: isCallerWaiting, completion: completion)
+        case .card:
+            handleCard(request, completion: completion)
         }
+    }
+
+    // MARK: - Kanban card
+
+    /// `card --done | --note | --show`. The card comes from `--id`, or —
+    /// the shape the launch prompt relies on — from the invoking tab
+    /// (`surface`), matched against the card that launched that session.
+    private func handleCard(_ request: KookyCLIRequest, completion: @escaping @MainActor (KookyCLIResponse) -> Void) {
+        let board = board()
+        let card: KanbanCard
+        if let raw = request.cardId {
+            guard let id = UUID(uuidString: raw) else {
+                return completion(refuse("--id expects a card UUID"))
+            }
+            guard let found = board.card(id: id) else {
+                return completion(refuse("no card with id \(id.uuidString)"))
+            }
+            card = found
+        } else if let raw = request.surface, let surface = UUID(uuidString: raw) {
+            guard let found = board.card(launchedSession: surface) else {
+                return completion(refuse("this tab was not launched from a Kanban card — pass --id <card-uuid>"))
+            }
+            card = found
+        } else {
+            return completion(refuse("card needs --id <card-uuid> (or run it inside the card's agent tab)"))
+        }
+        if request.cardAction == "start" {
+            // Same path as dragging the card to In Progress: move, then
+            // launch into the key window (or the fallback window).
+            guard let context = windows().first(where: \.isKey) ?? windows().first ?? fallbackWindow()?.context else {
+                return completion(refuse("kooky has no window to launch into"))
+            }
+            let outcome = board.move(card.id, to: .inProgress)
+            // In Progress with no live tab (kooky was restarted, or the tab
+            // was closed): a relaunch is what the caller means.
+            let deadInProgress: Bool = {
+                guard case .moved = outcome, card.column == .inProgress else { return false }
+                return card.launchedSessionId.flatMap(locate) == nil
+            }()
+            switch outcome {
+            case .rejected(let reasons):
+                return completion(refuse("card is not ready: \(reasons.joined(separator: ", "))"))
+            case .moved where !deadInProgress:
+                return completion(ok(note: "card \"\(card.title)\" is already running — nothing launched"))
+            case .moved, .needsLaunch:
+                Task { @MainActor in
+                    if let failure = await KanbanLaunchCoordinator.launch(cardId: card.id, board: board, store: context.store) {
+                        completion(self.refuse("launch failed: \(failure)"))
+                    } else {
+                        let launched = board.card(id: card.id)
+                        completion(self.ok(
+                            tabId: launched?.launchedSessionId?.uuidString,
+                            note: "launched \(launched?.agentId ?? card.agentId) for \"\(card.title)\" on \(launched?.branchName ?? card.branchName)"
+                        ))
+                    }
+                }
+                return
+            }
+        }
+        completion(handleCardSync(request, card: card, board: board))
+    }
+
+    private func handleCardSync(_ request: KookyCLIRequest, card: KanbanCard, board: KanbanStore) -> KookyCLIResponse {
+        // Capture the agent's conversation id while its tab is still alive —
+        // a later relaunch resumes it instead of starting over.
+        if let sessionId = card.launchedSessionId,
+           let hit = locate(sessionId),
+           let conversationId = hit.session.conversationId {
+            board.recordConversationId(conversationId, forSession: sessionId)
+        }
+        switch request.cardAction {
+        case "done":
+            guard card.column == .inProgress else {
+                return ok(note: "card \"\(card.title)\" is in \(card.column.rawValue), not In Progress — nothing moved")
+            }
+            board.move(card.id, to: .inReview)
+            return ok(note: "card \"\(card.title)\" moved to In Review")
+        case "note":
+            guard let text = request.note?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+                return refuse("--note needs text")
+            }
+            board.appendNote(id: card.id, text: text)
+            return ok(note: "noted on \"\(card.title)\"")
+        case "show":
+            return ok(note: Self.renderCard(card))
+        default:
+            return refuse("card needs one of --start, --done, --note <text>, --show")
+        }
+    }
+
+    /// Plain-text card summary for `card --show` — what an agent reads
+    /// back to re-orient itself.
+    static func renderCard(_ card: KanbanCard) -> String {
+        var lines: [String] = []
+        lines.append("card \(card.id.uuidString)")
+        lines.append("title: \(card.title)")
+        lines.append("column: \(card.column.rawValue)")
+        lines.append("branch: \(card.branchName)")
+        if let worktree = card.worktreePath { lines.append("worktree: \(worktree.path)") }
+        lines.append("agent: \(card.agentId)\(card.model.map { " (\($0))" } ?? "")")
+        lines.append("")
+        lines.append("requirement:")
+        lines.append(card.requirement)
+        lines.append("")
+        lines.append("acceptance criteria:")
+        for criterion in card.effectiveCriteria { lines.append("- [ ] \(criterion)") }
+        let notes = card.events.filter { $0.message.hasPrefix("note: ") }
+        if !notes.isEmpty {
+            lines.append("")
+            lines.append("notes:")
+            for note in notes.suffix(10) { lines.append("- \(note.message.dropFirst("note: ".count))") }
+        }
+        return lines.joined(separator: "\n")
     }
 
     // MARK: - Verbs

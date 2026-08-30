@@ -81,7 +81,7 @@ final class KanbanCardTests: XCTestCase {
             agentId: "claude-code",
             skill: "develop"
         )
-        let prompt = card.promptText(worktreePath: URL(fileURLWithPath: "/tmp/kanban-project-feature"), branch: "feature/kanban-board")
+        let prompt = card.promptText(workingDirectory: URL(fileURLWithPath: "/tmp/kanban-project-feature"), branch: "feature/kanban-board", isWorktree: true)
         let lines = prompt.components(separatedBy: "\n")
         XCTAssertEqual(lines.first, "/develop", "skill goes first so the CLI treats it as a slash command")
         XCTAssertTrue(prompt.contains("# Feature: Kanban board"))
@@ -90,15 +90,24 @@ final class KanbanCardTests: XCTestCase {
         XCTAssertTrue(prompt.contains("- [ ] State persists"))
         XCTAssertTrue(prompt.contains("`/tmp/kanban-project-feature`"))
         XCTAssertTrue(prompt.contains("`feature/kanban-board`"))
-        XCTAssertTrue(prompt.contains("kooky-cli card done \(card.id.uuidString)"))
+        XCTAssertTrue(prompt.contains("kooky-cli card --done --id \(card.id.uuidString)"))
+    }
+
+    func testPromptTextWordsInPlaceLaunchDifferently() {
+        let card = KanbanCard(title: "T", requirement: "R", acceptanceCriteria: ["A"], projectRoot: root, agentId: "claude-code")
+        let inPlace = card.promptText(workingDirectory: root, branch: "main", isWorktree: false)
+        XCTAssertTrue(inPlace.contains("working in the repository `/tmp/kanban-project` on branch `main`"), inPlace)
+        XCTAssertFalse(inPlace.contains("worktree"), inPlace)
+        let worktree = card.promptText(workingDirectory: root, branch: "feature/x", isWorktree: true)
+        XCTAssertTrue(worktree.contains("git worktree"), worktree)
     }
 
     func testPromptTextNormalizesSkillSlash() {
         var card = KanbanCard(title: "T", requirement: "R", acceptanceCriteria: ["A"], projectRoot: root, agentId: "claude-code")
         card.skill = "/plan"
-        XCTAssertTrue(card.promptText(worktreePath: root, branch: "b").hasPrefix("/plan\n"))
+        XCTAssertTrue(card.promptText(workingDirectory: root, branch: "b", isWorktree: true).hasPrefix("/plan\n"))
         card.skill = nil
-        XCTAssertTrue(card.promptText(worktreePath: root, branch: "b").hasPrefix("# Feature: T"))
+        XCTAssertTrue(card.promptText(workingDirectory: root, branch: "b", isWorktree: true).hasPrefix("# Feature: T"))
     }
 
     // MARK: - Events

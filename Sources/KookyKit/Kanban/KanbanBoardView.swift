@@ -95,7 +95,15 @@ struct KanbanBoardView: View {
                 .help(canCreateCard
                       ? String(localized: "Add a card to this project", bundle: bundle)
                       : String(localized: "Open a git repository as a workspace first", bundle: bundle))
-            BracketButton("terminals") {
+            // Split ↔ full: the terminal beside the board is the real pane
+            // host, so "watch the agent" is just "activate its tab".
+            BracketButton(store.mainContent == .kanbanSplit ? "hide terminal" : "show terminal") {
+                withAnimation(Theme.chromeTransition) {
+                    store.setMainContent(store.mainContent == .kanbanSplit ? .kanban : .kanbanSplit)
+                }
+            }
+            .help(String(localized: "Show the live terminal next to the board", bundle: bundle))
+            BracketButton("close") {
                 withAnimation(Theme.chromeTransition) { store.setMainContent(.terminals) }
             }
         }
@@ -206,10 +214,12 @@ struct KanbanBoardView: View {
                     ForEach(cards) { card in
                         KanbanCardView(
                             card: card,
-                            status: liveStatus(for: card),
+                            live: liveStatus(for: card),
                             isLaunching: launchingCardIds.contains(card.id),
                             onOpen: { editingCard = card },
+                            onWatch: { watch(card) },
                             onReveal: { reveal(card) },
+                            onRelaunch: { relaunch(card) },
                             onMove: { target in move(card.id, to: target) },
                             onDelete: { board.remove(id: card.id) }
                         )
@@ -236,6 +246,9 @@ struct KanbanBoardView: View {
     // MARK: Actions
 
     private func move(_ id: UUID, to column: KanbanColumn) {
+        if let card = board.card(id: id), card.column == .inProgress {
+            KanbanLaunchCoordinator.syncConversationId(card: card, board: board, store: store)
+        }
         switch board.move(id, to: column) {
         case .moved:
             break
@@ -264,15 +277,51 @@ struct KanbanBoardView: View {
         }
     }
 
+    /// In Progress card whose tab is gone (restart, closed tab): start the
+    /// agent again in place — resuming the captured conversation if any.
+    private func relaunch(_ card: KanbanCard) {
+        launchingCardIds.insert(card.id)
+        Task { @MainActor in
+            let failure = await KanbanLaunchCoordinator.launch(cardId: card.id, board: board, store: store)
+            launchingCardIds.remove(card.id)
+            if let failure { show(Notice(text: failure, tone: .failure)) }
+        }
+    }
+
     private func reveal(_ card: KanbanCard) {
         guard let sessionId = card.launchedSessionId else { return }
         board.revealSession(sessionId)
     }
 
-    private func liveStatus(for card: KanbanCard) -> AgentMonitor.State? {
+    private func liveStatus(for card: KanbanCard) -> KanbanLiveStatus? {
         guard let sessionId = card.launchedSessionId,
               let hit = store.locateSession(sessionId) else { return nil }
-        return AgentMonitor.state(of: hit.session)
+        let watched = hit.store === store
+            && store.activeWorkspaceId == hit.workspace.id
+            && hit.workspace.activeSession?.id == sessionId
+            && store.mainContent == .kanbanSplit
+        return KanbanLiveStatus(
+            state: AgentMonitor.state(of: hit.session),
+            tabTitle: singleLine(hit.session.title),
+            isWatched: watched
+        )
+    }
+
+    /// Single click on a launched card. Same window: switch the board to
+    /// split (if needed) and make the card's tab the active one beside it.
+    /// Another window: hand off to the app-level reveal.
+    private func watch(_ card: KanbanCard) {
+        guard let sessionId = card.launchedSessionId,
+              let hit = store.locateSession(sessionId) else { return }
+        guard hit.store === store else {
+            board.revealSession(sessionId)
+            return
+        }
+        withAnimation(Theme.chromeTransition) {
+            if store.mainContent != .kanbanSplit { store.setMainContent(.kanbanSplit) }
+        }
+        store.activateWorkspace(hit.workspace)
+        store.activateTab(hit.session, in: hit.workspace)
     }
 
     private func show(_ new: Notice) {
@@ -289,7 +338,10 @@ struct KanbanBoardView: View {
         let root = selectedProject ?? activeProjectRoot ?? URL(fileURLWithPath: NSHomeDirectory())
         let defaultAgent = AgentTemplate.defaultLaunchTemplate(model: KookySettingsModel.shared)
             ?? AgentTemplate.claudeCode
-        return KanbanCard(projectRoot: root, agentId: defaultAgent.isShell ? AgentTemplate.claudeCodeID : defaultAgent.id)
+        // Branch stays empty here: the editor fills in the repo's current
+        // branch once it has read git (off-thread) — a card is "work on
+        // main" by default, a feature branch is one click away.
+        return KanbanCard(projectRoot: root, agentId: defaultAgent.isShell ? AgentTemplate.claudeCodeID : defaultAgent.id, branchName: "")
     }
 
     private func resolveActiveProject() async {

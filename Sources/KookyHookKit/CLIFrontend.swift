@@ -22,6 +22,9 @@ public enum KookyCLICommand: Equatable, Sendable {
     case close(tab: String)
     case rename(tab: String, title: String)
     case status(json: Bool)
+    /// `card --done | --note <text> | --show [--id <card-uuid>]`. Without
+    /// `--id` the app resolves the card from the invoking tab.
+    case card(action: String, id: String?, note: String?)
     case help
 }
 
@@ -76,11 +79,16 @@ extension KookyHookKit {
             boolFlags: ["--json"],
             usage: "usage: kooky-cli status [--json]"
         ),
+        "card": VerbSpec(
+            valueFlags: ["--id", "--note"],
+            boolFlags: ["--done", "--show", "--start"],
+            usage: "usage: kooky-cli card (--start | --done | --note <text> | --show) [--id <card-uuid>]"
+        ),
     ]
 
     private static func unknownVerbFailure(_ verb: String) -> KookyCLIParseFailure {
         KookyCLIParseFailure(
-            "unknown command '\(verb)' — one of: open, resume, list, focus, close, rename, status. Run `kooky-cli --help`."
+            "unknown command '\(verb)' — one of: open, resume, list, focus, close, rename, status, card. Run `kooky-cli --help`."
         )
     }
 
@@ -192,6 +200,19 @@ extension KookyHookKit {
             }
         case "status":
             return .success(.status(json: bools.contains("--json")))
+        case "card":
+            var actions: [String] = []
+            if bools.contains("--start") { actions.append("start") }
+            if bools.contains("--done") { actions.append("done") }
+            if bools.contains("--show") { actions.append("show") }
+            if values["--note"] != nil { actions.append("note") }
+            guard actions.count == 1, let action = actions.first else {
+                return .failure(KookyCLIParseFailure("card needs exactly one of --start, --done, --note <text>, --show. \(spec.usage)"))
+            }
+            if let raw = values["--id"], UUID(uuidString: raw) == nil {
+                return .failure(KookyCLIParseFailure("--id expects a card UUID — the launch prompt carries it."))
+            }
+            return .success(.card(action: action, id: values["--id"], note: values["--note"]))
         default:
             // Unreachable while the switch covers every verbSpecs key; kept
             // identical to the entry guard so a future verb added to the
@@ -202,7 +223,7 @@ extension KookyHookKit {
 
     /// The wire request for a parsed command; nil for `help` (local-only).
     /// Path normalization is the caller's job — this maps fields verbatim.
-    public static func cliRequest(for command: KookyCLICommand) -> KookyCLIRequest? {
+    public static func cliRequest(for command: KookyCLICommand, surfaceId: String? = nil) -> KookyCLIRequest? {
         switch command {
         case .open(let cwd, let cmd, let agent, let title, let noFocus):
             // `noFocus` ships only when set: an absent optional keeps the
@@ -228,6 +249,8 @@ extension KookyHookKit {
             return KookyCLIRequest(verb: .rename, tab: tab, title: title)
         case .status:
             return KookyCLIRequest(verb: .status)
+        case .card(let action, let id, let note):
+            return KookyCLIRequest(verb: .card, cardAction: action, cardId: id, note: note, surface: surfaceId)
         case .help:
             return nil
         }
@@ -275,6 +298,14 @@ extension KookyHookKit {
                                   set a tab's title (clear it in-app)
           status [--json]         app version + protocol; exits 1 when
                                   kooky isn't running
+          card (--start | --done | --note <text> | --show) [--id <card-uuid>]
+                                  Kanban board round-trip: --start moves
+                                  the card to In Progress and launches its
+                                  agent (like dragging it there);
+                                  --done moves the card to In Review,
+                                  --note appends to its history, --show
+                                  prints it. Inside a kooky tab the card
+                                  is found from the tab; --id overrides.
 
         Exit code 0 means the request was accepted; anything else prints one
         reason line on stderr. Every command except `status` launches kooky

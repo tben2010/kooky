@@ -114,6 +114,60 @@ final class KanbanStore {
         cards.first { $0.launchedSessionId == sessionId }
     }
 
+    /// Like `card(launchedSession:)` but survives the card leaving In
+    /// Progress — for alerts that trail the agent's exit.
+    func card(everLaunchedSession sessionId: UUID) -> KanbanCard? {
+        cards.first { $0.lastLaunchedSessionId == sessionId }
+    }
+
+    /// Seconds since the card's last `launched …` event; nil if never.
+    func secondsSinceLaunch(id: UUID, now: Date = Date()) -> TimeInterval? {
+        guard let card = card(id: id),
+              let launched = card.events.last(where: { $0.message.hasPrefix("launched") }) else { return nil }
+        return now.timeIntervalSince(launched.timestamp)
+    }
+
+    /// The agent tab reported it's done (`.completed`). A real run moves
+    /// to In Review; an exit within seconds of the launch is a failed start
+    /// (bad resume id, missing binary, refused prompt) and bounces to Ready
+    /// so the board never shows "review this" for work that never began.
+    static let quickExitWindow: TimeInterval = 15
+    @discardableResult
+    func agentFinished(sessionId: UUID, now: Date = Date()) -> KanbanColumn? {
+        guard let card = card(launchedSession: sessionId), card.column == .inProgress else { return nil }
+        if let elapsed = secondsSinceLaunch(id: card.id, now: now), elapsed < Self.quickExitWindow {
+            markLaunchFailed(id: card.id, message: "agent exited \(Int(elapsed))s after start")
+            return .ready
+        }
+        move(card.id, to: .inReview)
+        return .inReview
+    }
+
+    /// The agent process exited non-zero. Whether the card is still In
+    /// Progress or was just auto-moved to In Review by the trailing
+    /// `completed`, that isn't a finished feature: back to Ready with the
+    /// status on record.
+    func agentFailed(sessionId: UUID, exitCode: Int) {
+        guard let card = card(everLaunchedSession: sessionId),
+              card.column == .inProgress || card.column == .inReview,
+              let idx = cards.firstIndex(where: { $0.id == card.id }) else { return }
+        var updated = cards[idx]
+        updated.column = .ready
+        updated.clearLaunchLinks()
+        updated.record("agent exited with status \(exitCode) — back to Ready")
+        cards[idx] = updated
+        scheduleSave()
+    }
+
+    /// A stored conversation id turned out not to exist on disk — forget
+    /// it so the next launch starts fresh instead of failing the resume.
+    func dropConversationId(id: UUID) {
+        guard let idx = cards.firstIndex(where: { $0.id == id }), cards[idx].conversationId != nil else { return }
+        cards[idx].conversationId = nil
+        cards[idx].record("stale conversation id dropped — next launch starts fresh")
+        scheduleSave()
+    }
+
     // MARK: Mutation
 
     func add(_ card: KanbanCard) {
@@ -179,15 +233,19 @@ final class KanbanStore {
         return outcome
     }
 
-    /// Called by the launch coordinator once the worktree + agent tab exist.
-    func markLaunched(id: UUID, worktreePath: URL, workspaceId: UUID, sessionId: UUID, branch: String) {
+    /// Called by the launch coordinator once the agent tab exists.
+    /// `worktreePath` nil = the agent works in the repo itself (card on the
+    /// main checkout's branch); the card then carries no worktree pin.
+    func markLaunched(id: UUID, worktreePath: URL?, workspaceId: UUID, sessionId: UUID, branch: String) {
         guard let idx = cards.firstIndex(where: { $0.id == id }) else { return }
         var card = cards[idx]
-        card.worktreePath = worktreePath.standardizedFileURL
+        card.worktreePath = worktreePath?.standardizedFileURL
         card.launchedWorkspaceId = workspaceId
         card.launchedSessionId = sessionId
+        card.lastLaunchedSessionId = sessionId
         card.branchName = branch
-        card.record("launched \(card.agentId) in \(worktreePath.lastPathComponent)")
+        let place = worktreePath.map { "worktree \($0.lastPathComponent)" } ?? "repo on \(branch)"
+        card.record("launched \(card.agentId) in \(place)")
         cards[idx] = card
         scheduleSave()
     }
@@ -202,6 +260,15 @@ final class KanbanStore {
         card.clearLaunchLinks()
         card.record("launch failed: \(message)")
         cards[idx] = card
+        scheduleSave()
+    }
+
+    /// Agent-written note (`kooky-cli card --note`). Lands in the event
+    /// log with a `note: ` prefix so `card --show` can list notes apart
+    /// from column moves.
+    func appendNote(id: UUID, text: String) {
+        guard let idx = cards.firstIndex(where: { $0.id == id }) else { return }
+        cards[idx].record("note: \(singleLine(text))")
         scheduleSave()
     }
 

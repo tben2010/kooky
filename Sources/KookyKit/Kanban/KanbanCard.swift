@@ -73,6 +73,11 @@ struct KanbanCard: Codable, Equatable, Identifiable, Sendable {
     var worktreePath: URL?
     var launchedWorkspaceId: UUID?
     var launchedSessionId: UUID?
+    /// The most recent launched tab — NOT cleared when the card leaves In
+    /// Progress, so an agent-exit alert that lands after the auto-move to
+    /// In Review can still find its card. Optional so pre-field board.json
+    /// files decode.
+    var lastLaunchedSessionId: UUID?
     /// Agent conversation id captured from the launched session so a
     /// relaunch can resume rather than restart (Phase 2).
     var conversationId: String?
@@ -181,10 +186,12 @@ struct KanbanCard: Codable, Equatable, Identifiable, Sendable {
         return true
     }
 
-    /// The text the agent is launched with. `worktreePath` / `branch` are
-    /// passed in (not read from self) so the prompt describes the launch
-    /// that is actually happening, not a stale pin.
-    func promptText(worktreePath: URL, branch: String) -> String {
+    /// The text the agent is launched with. `workingDirectory` / `branch`
+    /// are passed in (not read from self) so the prompt describes the
+    /// launch that is actually happening, not a stale pin. `isWorktree`
+    /// picks the wording: a card on the main checkout's branch works in the
+    /// repo itself.
+    func promptText(workingDirectory: URL, branch: String, isWorktree: Bool) -> String {
         var lines: [String] = []
         if let skill = skill?.trimmingCharacters(in: .whitespacesAndNewlines), !skill.isEmpty {
             let slash = skill.hasPrefix("/") ? skill : "/\(skill)"
@@ -201,10 +208,16 @@ struct KanbanCard: Codable, Equatable, Identifiable, Sendable {
         }
         lines.append("")
         lines.append("## Working agreement")
-        lines.append("You are working in the git worktree `\(worktreePath.path)` on branch `\(branch)`.")
-        lines.append("Stay inside this worktree. Commit completed steps with clear messages.")
+        if isWorktree {
+            lines.append("You are working in the git worktree `\(workingDirectory.path)` on branch `\(branch)`.")
+            lines.append("Stay inside this worktree. Commit completed steps with clear messages.")
+        } else {
+            lines.append("You are working in the repository `\(workingDirectory.path)` on branch `\(branch)`.")
+            lines.append("Stay on this branch. Commit completed steps with clear messages.")
+        }
         lines.append("Do not merge into other branches.")
-        lines.append("When every acceptance criterion is met, run: `kooky-cli card done \(id.uuidString)`")
+        lines.append("Progress notes for the human: `kooky-cli card --note \"<text>\" --id \(id.uuidString)`")
+        lines.append("When every acceptance criterion is met, run: `kooky-cli card --done --id \(id.uuidString)`")
         return lines.joined(separator: "\n")
     }
 

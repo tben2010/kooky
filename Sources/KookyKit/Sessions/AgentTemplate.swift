@@ -111,6 +111,11 @@ struct AgentTemplate: Identifiable, Hashable {
     /// `reopenLastClosedTab`). `~/` is expanded; a missing path falls back
     /// to `$HOME` via `resolvedSpawnCwd`.
     let extraCwd: String?
+    /// CLI flag that selects a model for this binary (`claude --model
+    /// opus`, `codex -m gpt-5`). Nil = kooky doesn't know one; a Kanban
+    /// card's model field is then informational only. Like
+    /// `promptLaunchFlag`, a property of the binary — customs inherit it.
+    let modelFlag: String?
 
     /// True when this template launches a plain shell instead of an agent
     /// binary. Covers the default `.terminal` and every materialised
@@ -134,6 +139,7 @@ struct AgentTemplate: Identifiable, Hashable {
         iconAsset: String?,
         tintHex: String?,
         initialCommand: String?,
+        modelFlag: String? = nil,
         baseAgentId: String? = nil,
         promptLaunchFlag: String? = nil,
         resumeStrategy: ConversationResumeStrategy? = nil,
@@ -153,6 +159,7 @@ struct AgentTemplate: Identifiable, Hashable {
         self.reportsToolCalls = reportsToolCalls
         self.extraEnv = extraEnv
         self.extraCwd = extraCwd
+        self.modelFlag = modelFlag
     }
 
     var tint: Color? {
@@ -441,6 +448,7 @@ extension AgentTemplate {
         iconAsset: "claudecode",
         tintHex: "D97757",
         initialCommand: "claude",
+        modelFlag: "--model",
         resumeStrategy: .arguments(["--resume"]),
         reportsToolCalls: true
     )
@@ -452,6 +460,7 @@ extension AgentTemplate {
         iconAsset: "codex",
         tintHex: "7A9DFF",
         initialCommand: "codex",
+        modelFlag: "-m",
         resumeStrategy: .arguments(["resume"])
     )
 
@@ -462,6 +471,7 @@ extension AgentTemplate {
         iconAsset: "gemini",
         tintHex: "3186FF",
         initialCommand: "gemini",
+        modelFlag: "-m",
         resumeStrategy: .arguments(["--resume"])
     )
 
@@ -493,6 +503,7 @@ extension AgentTemplate {
         iconAsset: "cursor",
         tintHex: "F54E00",
         initialCommand: "cursor-agent",
+        modelFlag: "--model",
         resumeStrategy: .optionEquals("--resume")
     )
 
@@ -503,6 +514,7 @@ extension AgentTemplate {
         iconAsset: "githubcopilot",
         tintHex: "6E40C9",
         initialCommand: "copilot",
+        modelFlag: "--model",
         promptLaunchFlag: "-p",
         // Upstream shipped resume-by-id as an extension of `--resume`
         // (github/copilot-cli#167); the CLI rejects `--session-id` outright.
@@ -551,6 +563,7 @@ extension AgentTemplate {
         iconAsset: "antigravity",
         tintHex: "4285F4",
         initialCommand: "agy",
+        modelFlag: "-m",
         promptLaunchFlag: "-i",
         resumeStrategy: .optionEquals("--conversation")
     )
@@ -861,6 +874,7 @@ extension AgentTemplate {
             iconAsset: data.iconAsset.isEmpty ? base?.iconAsset : data.iconAsset,
             tintHex: data.tintHex.isEmpty ? base?.tintHex : data.tintHex,
             initialCommand: data.command.isEmpty ? base?.initialCommand : data.command,
+            modelFlag: base?.modelFlag,
             baseAgentId: data.baseAgentId.isEmpty ? nil : data.baseAgentId,
             promptLaunchFlag: base?.promptLaunchFlag,
             resumeStrategy: base?.resumeStrategy,

@@ -83,7 +83,7 @@ func printSuccess(_ response: KookyCLIResponse, for command: KookyCLICommand) {
         // One line either way; the id stays the third word for scripts.
         let head = response.tabId.map { "opened tab \(KookyHookKit.plain($0))" } ?? "opened"
         print(response.note.map { "\(head) — \(KookyHookKit.plain($0))" } ?? head)
-    case .resume, .focus, .close, .rename:
+    case .resume, .focus, .close, .rename, .card:
         print(KookyHookKit.plain(response.note ?? "ok"))
     case .help:
         break
@@ -128,7 +128,10 @@ default:
     command = parsed
 }
 
-guard let request = KookyHookKit.cliRequest(for: command),
+// The invoking tab's id (set by kooky in every session's environment)
+// lets `card` find its card without `--id`. Absent outside kooky.
+let surfaceId = ProcessInfo.processInfo.environment["KOOKY_SURFACE_ID"]
+guard let request = KookyHookKit.cliRequest(for: command, surfaceId: surfaceId),
       let line = request.encodedLine()
 else {
     fail("internal error: request encoding failed")

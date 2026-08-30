@@ -424,8 +424,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// is actually visible after the jump.
     private func revealSessionForKanban(_ sessionId: UUID) {
         guard let hit = dockTabLocation(for: sessionId) else { return }
-        withAnimation(Theme.chromeTransition) {
-            hit.controller.store.setMainContent(.terminals)
+        // A split board keeps showing — the tab lands in its right half.
+        if hit.controller.store.mainContent == .kanban {
+            withAnimation(Theme.chromeTransition) {
+                hit.controller.store.setMainContent(.terminals)
+            }
         }
         revealTab(hit.session, in: hit.workspace, controller: hit.controller)
     }
@@ -840,12 +843,21 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             isRead: visible
         )
         // A Kanban card's agent exiting is the board's "hand it back to the
-        // human" signal: In Progress → In Review. Fallback for agents that
-        // never call `kooky-cli card done`; a no-op for any other column.
-        if kind == .completed,
-           let card = KanbanStore.shared.card(launchedSession: sessionId),
-           card.column == .inProgress {
-            KanbanStore.shared.move(card.id, to: .inReview)
+        // human" signal: In Progress → In Review (or back to Ready when it
+        // died right after start / with a non-zero status). Fallback for
+        // agents that never call `kooky-cli card --done`.
+        switch kind {
+        case .completed:
+            if let conversationId = location.session.conversationId {
+                KanbanStore.shared.recordConversationId(conversationId, forSession: sessionId)
+            }
+            KanbanStore.shared.agentFinished(sessionId: sessionId)
+        case .failure:
+            if let exit = location.session.lastCommandExit {
+                KanbanStore.shared.agentFailed(sessionId: sessionId, exitCode: exit)
+            }
+        default:
+            break
         }
         // System banner: attention / failure only, gated on the setting + its
         // sub-toggle + visibility. Completed is inbox-only (never a banner).
@@ -1460,9 +1472,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         case .openRecentFolder(let path):
             openRecentFolder(atPath: path)
         case .kanbanBoard:
-            guard let store = activeStore else { return }
+            guard let store = activeStore, !store.mainContent.showsKanban else { return }
             withAnimation(Theme.chromeTransition) {
-                store.setMainContent(.kanban)
+                store.toggleKanban()
             }
         }
     }
@@ -1733,7 +1745,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     @objc private func handleToggleKanban() {
         guard let store = activeStore else { return }
         withAnimation(Theme.chromeTransition) {
-            store.setMainContent(store.mainContent == .kanban ? .terminals : .kanban)
+            store.toggleKanban()
         }
     }
 
