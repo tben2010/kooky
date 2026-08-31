@@ -751,6 +751,11 @@ final class WorkspaceStore {
     /// cleared by the sheet on dismiss / confirm.
     var pendingRemovalRequest: Workspace?
 
+    /// Sidebar right-click → "New Kanban Card…": the repo root the board
+    /// should open its editor for. Runtime-only; the board consumes and
+    /// clears it.
+    var pendingNewCardProjectRoot: URL?
+
     /// Cross-view create request. Sidebar rows open the sheet directly, but
     /// global entry points such as the command palette need to ask the
     /// sidebar to host the sheet, especially when the sidebar was hidden and

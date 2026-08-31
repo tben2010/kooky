@@ -213,6 +213,9 @@ struct SidebarWorkspaceRow: View {
     /// sidebar wires to a sheet. Nil on worktree rows so worktree
     /// nesting stays disabled.
     var onCreateWorktree: (() -> Void)? = nil
+    /// Non-nil on local workspaces: opens the Kanban board with the card
+    /// editor pre-set to this workspace's repo.
+    var onNewCard: (() -> Void)? = nil
     /// Non-nil for worktree rows — jumps the active selection back to the
     /// source workspace this worktree was forked from. Cheap navigation
     /// shortcut when the user is deep in a worktree and wants the main
@@ -270,6 +273,14 @@ struct SidebarWorkspaceRow: View {
                         // dismissing before the sheet anchors — back-to-back
                         // popovers/sheets off the same view glitch otherwise.
                         DispatchQueue.main.async { onCreateWorktree() }
+                    }
+                }
+                if let onNewCard {
+                    KookyMenuRow(title: "New Kanban Card…") {
+                        isContextMenuOpen = false
+                        // Same one-tick deferral as Create Worktree: let the
+                        // menu popover dismiss before the board swaps in.
+                        DispatchQueue.main.async { onNewCard() }
                     }
                 }
                 if let onGoToSource {

@@ -519,6 +519,7 @@ struct SidebarView: View {
                             isCompact: isCompact,
                             draggingId: $draggingWorkspaceId,
                             onCreateWorktree: canCreate ? { presentCreateWorktree(workspace) } : nil,
+                            onNewCard: workspace.sshRemoteHost == nil ? { presentNewCard(workspace) } : nil,
                             onGoToSource: goToSource
                         )
                     }
@@ -576,7 +577,8 @@ struct SidebarView: View {
                     toggle: { toggleCollapsed(parent.id) }
                 )
                 : nil,
-            onCreateWorktree: canCreate ? { presentCreateWorktree(parent) } : nil
+            onCreateWorktree: canCreate ? { presentCreateWorktree(parent) } : nil,
+            onNewCard: parent.sshRemoteHost == nil ? { presentNewCard(parent) } : nil
         )
 
         if hasWorktrees && !isCollapsed {
@@ -632,6 +634,20 @@ struct SidebarView: View {
         }
     }
 
+    /// Right-click → "New Kanban Card…": resolve the workspace's repo root
+    /// off-main (git subprocess), hand it to the board, and bring the board
+    /// up if the window is showing terminals.
+    private func presentNewCard(_ workspace: Workspace) {
+        Task { @MainActor in
+            let root = await KanbanLaunchCoordinator.projectRoot(for: workspace, in: store)
+                ?? workspace.workingDirectory.standardizedFileURL
+            store.pendingNewCardProjectRoot = root
+            if store.mainContent == .terminals {
+                withAnimation(Theme.chromeTransition) { store.toggleKanban() }
+            }
+        }
+    }
+
     private func presentCreateWorktree(_ workspace: Workspace) {
         // Single channel: parking on the store triggers the `.onChange`
         // observer that sets `sheet`. Direct row clicks and command-palette
@@ -655,6 +671,7 @@ private struct DraggableWorkspaceRow: View {
     /// without this wrapper, so they don't pick up drag/drop handlers.
     var disclosure: SidebarWorkspaceRow.WorktreeDisclosure? = nil
     var onCreateWorktree: (() -> Void)? = nil
+    var onNewCard: (() -> Void)? = nil
     var onGoToSource: (() -> Void)? = nil
 
     @State private var isTargeted = false
@@ -681,6 +698,7 @@ private struct DraggableWorkspaceRow: View {
             onSetTag: { store.setTag($0, for: workspace) },
             disclosure: disclosure,
             onCreateWorktree: onCreateWorktree,
+            onNewCard: onNewCard,
             onGoToSource: onGoToSource
         )
         .dropIndicator(active: isTargeted && !isSelfDrag, on: edge)

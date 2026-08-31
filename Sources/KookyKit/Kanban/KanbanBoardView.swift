@@ -48,6 +48,8 @@ struct KanbanBoardView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Theme.chromeBackground)
         .task(id: store.activeWorkspaceId) { await resolveActiveProject() }
+        .onAppear { consumePendingNewCard() }
+        .onChange(of: store.pendingNewCardProjectRoot?.path) { _, _ in consumePendingNewCard() }
         .sheet(item: $editingCard) { card in
             KanbanCardEditorSheet(
                 card: card,
@@ -268,7 +270,7 @@ struct KanbanBoardView: View {
         }
         switch board.move(id, to: column) {
         case .moved:
-            break
+            if column == .done { offerWorktreeCleanup(id) }
         case .rejected(let reasons):
             let joined = reasons
                 .map { String(localized: String.LocalizationValue($0), bundle: bundle) }
@@ -302,6 +304,45 @@ struct KanbanBoardView: View {
             let failure = await KanbanLaunchCoordinator.launch(cardId: card.id, board: board, store: store)
             launchingCardIds.remove(card.id)
             if let failure { show(Notice(text: failure, tone: .failure)) }
+        }
+    }
+
+    /// Sidebar right-click parked a repo root on the store: open the card
+    /// editor for it. Consumed here (not in the sidebar) so the flow works
+    /// whether the board was already up or is appearing right now.
+    private func consumePendingNewCard() {
+        guard let root = store.pendingNewCardProjectRoot else { return }
+        store.pendingNewCardProjectRoot = nil
+        selectedProject = root
+        userPickedProject = true
+        editingCard = nil
+        isCreatingCard = true
+    }
+
+    /// A card just landed in Done and owns a worktree. Its sidebar entry
+    /// (when there is one) goes through the existing close flow — the same
+    /// confirm sheet with the "also delete worktree directory and branch"
+    /// checkbox, so removal keeps its one implementation and its safety
+    /// (`git branch -d` only deletes merged branches). A worktree that is
+    /// only on disk gets a notice instead of silent deletion.
+    private func offerWorktreeCleanup(_ id: UUID) {
+        guard let card = board.card(id: id), let worktree = card.worktreePath else { return }
+        let key = worktree.standardizedFileURL.path
+        if let workspace = store.workspaces.first(where: { $0.worktreePath?.standardizedFileURL.path == key }) {
+            // The confirm sheet lives in the sidebar — reveal it if hidden,
+            // the same courtesy the command palette's worktree route pays.
+            if store.sidebarMode == .hidden {
+                withAnimation(Theme.chromeTransition) { store.setSidebarMode(.full) }
+            }
+            store.requestCloseWorkspace(workspace)
+        } else if FileManager.default.fileExists(atPath: worktree.path) {
+            show(Notice(
+                text: String.localizedStringWithFormat(
+                    String(localized: "worktree %@ stays on disk — adopt it via Create Worktree to remove it", bundle: bundle),
+                    worktree.lastPathComponent
+                ),
+                tone: .info
+            ))
         }
     }
 
