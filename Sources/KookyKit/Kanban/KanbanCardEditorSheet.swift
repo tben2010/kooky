@@ -24,6 +24,11 @@ struct KanbanCardEditorSheet: View {
     /// Branches + worktrees of the card's repo, read off-thread on appear.
     /// nil until loaded (or when the project isn't a git repo).
     @State private var repoInfo: KanbanRepoInfo?
+    /// "draft with agent" round-trip state. The proposal never lands in the
+    /// fields on its own — the user applies or discards it.
+    @State private var isDrafting = false
+    @State private var draftError: String?
+    @State private var draftProposal: KanbanCardDraft?
 
     private var bundle: Bundle { .kookyResources }
 
@@ -229,8 +234,36 @@ struct KanbanCardEditorSheet: View {
                     .padding(8)
                     .bracketBorder()
             }
-            field("requirement") {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .center) {
+                    Text(LocalizedStringKey("requirement"), bundle: bundle)
+                        .font(Theme.mono(10, weight: .medium))
+                        .tracking(1.2)
+                        .foregroundStyle(Theme.chromeMuted.opacity(0.85))
+                    Spacer()
+                    if isDrafting {
+                        ProgressView().controlSize(.mini)
+                        Text(String(localized: "asking the agent…", bundle: bundle))
+                            .font(Theme.mono(10))
+                            .foregroundStyle(Theme.chromeMuted)
+                    } else {
+                        BracketButton("draft with agent") { runDraft() }
+                            .disabled(!canDraft)
+                            .opacity(canDraft ? 1 : 0.4)
+                            .help(draftHelp)
+                    }
+                }
                 editor($draft.requirement, minHeight: 110)
+                if let draftError {
+                    Text(draftError)
+                        .font(Theme.mono(10.5))
+                        .foregroundStyle(Theme.activityFailure.opacity(0.85))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if let draftProposal {
+                proposalView(draftProposal)
             }
             field("acceptance-criteria (one per line)") {
                 editor($criteriaText, minHeight: 90)
@@ -377,6 +410,90 @@ struct KanbanCardEditorSheet: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.top, 14)
         }
+    }
+
+    // MARK: Draft with agent
+
+    private var canDraft: Bool {
+        KanbanCardDrafter.supports(selectedTemplate)
+            && !draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var draftHelp: String {
+        if !KanbanCardDrafter.supports(selectedTemplate) {
+            return String(localized: "Drafting needs a Claude Code based agent", bundle: bundle)
+        }
+        if draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return String(localized: "Enter a title first", bundle: bundle)
+        }
+        return String(localized: "Let the agent write requirement and acceptance criteria from the title and your notes — it reads the repository, changes nothing, and you review before anything is applied", bundle: bundle)
+    }
+
+    private func runDraft() {
+        guard canDraft, !isDrafting else { return }
+        isDrafting = true
+        draftError = nil
+        draftProposal = nil
+        let title = draft.title
+        let requirement = draft.requirement
+        let criteria = criteriaText.split(whereSeparator: \.isNewline).map(String.init)
+        let root = draft.projectRoot
+        let template = selectedTemplate
+        let model = modelText.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task { @MainActor in
+            let result = await KanbanCardDrafter.draft(
+                title: title,
+                requirement: requirement,
+                criteria: criteria,
+                projectRoot: root,
+                template: template,
+                model: model.isEmpty ? nil : model
+            )
+            isDrafting = false
+            switch result {
+            case .success(let proposal):
+                draftProposal = proposal
+            case .failure(let error):
+                draftError = error.message
+            }
+        }
+    }
+
+    /// The agent's proposal, previewed next to the user's own text with an
+    /// explicit apply — replacing what the user typed is their click, not
+    /// the agent's.
+    private func proposalView(_ proposal: KanbanCardDraft) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(String(localized: "AGENT-PROPOSAL", bundle: bundle))
+                .font(Theme.mono(10, weight: .medium))
+                .tracking(1.6)
+                .foregroundStyle(Theme.activityRunning.opacity(0.9))
+            Text(proposal.requirement)
+                .font(Theme.mono(11.5))
+                .foregroundStyle(Theme.chromeForeground)
+                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(Array(proposal.acceptanceCriteria.enumerated()), id: \.offset) { _, criterion in
+                    Text("- [ ] \(criterion)")
+                        .font(Theme.mono(11))
+                        .foregroundStyle(Theme.chromeMuted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            HStack(spacing: 10) {
+                Spacer()
+                BracketButton("discard") { draftProposal = nil }
+                BracketButton("apply") {
+                    draft.requirement = proposal.requirement
+                    criteriaText = proposal.acceptanceCriteria.joined(separator: "\n")
+                    draftProposal = nil
+                }
+            }
+        }
+        .padding(12)
+        .background(Theme.activityRunning.opacity(0.06))
+        .overlay(Rectangle().stroke(Theme.activityRunning.opacity(0.5), lineWidth: 1))
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: Helpers
