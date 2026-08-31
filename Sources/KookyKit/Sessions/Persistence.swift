@@ -296,10 +296,25 @@ protocol Persistence {
 final class AppPersistence {
     /// The real `state.json`. Tests inject a temp path via `init(fileURL:)`.
     static var defaultFileURL: URL {
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = support.appendingPathComponent("kooky", isDirectory: true)
+        dataDirectory.appendingPathComponent("state.json")
+    }
+
+    /// `~/Library/Application Support/kooky`, or `$KOOKY_DATA_DIR` when set.
+    /// The override exists for development builds: two kookys (the
+    /// installed app and a `swift run`) sharing one `state.json` overwrite
+    /// each other's windows — whichever saves last wins, and the other's
+    /// tabs are gone at its next launch. `board.json` lives here too.
+    static var dataDirectory: URL {
+        let dir: URL
+        if let override = ProcessInfo.processInfo.environment["KOOKY_DATA_DIR"],
+           !override.trimmingCharacters(in: .whitespaces).isEmpty {
+            dir = URL(fileURLWithPath: (override as NSString).expandingTildeInPath, isDirectory: true)
+        } else {
+            let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            dir = support.appendingPathComponent("kooky", isDirectory: true)
+        }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("state.json")
+        return dir
     }
 
     private let fileURL: URL
