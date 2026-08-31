@@ -15,9 +15,7 @@ protocol KanbanPersistence {
 @MainActor
 struct FileKanbanPersistence: KanbanPersistence {
     static var defaultFileURL: URL {
-        AppPersistence.defaultFileURL
-            .deletingLastPathComponent()
-            .appendingPathComponent("board.json")
+        AppPersistence.dataDirectory.appendingPathComponent("board.json")
     }
 
     /// Versioned envelope so a future shape change can branch on `version`
@@ -147,15 +145,33 @@ final class KanbanStore {
     /// Progress or was just auto-moved to In Review by the trailing
     /// `completed`, that isn't a finished feature: back to Ready with the
     /// status on record.
-    func agentFailed(sessionId: UUID, exitCode: Int) {
+    func agentFailed(sessionId: UUID, exitCode: Int, now: Date = Date()) {
         guard let card = card(everLaunchedSession: sessionId),
-              card.column == .inProgress || card.column == .inReview,
               let idx = cards.firstIndex(where: { $0.id == card.id }) else { return }
+        // Still the running launch, or the auto-move to In Review that the
+        // trailing exit marker follows by a moment. A reopened conversation
+        // the user quit later must not bounce the card.
+        let justReviewed = card.column == .inReview
+            && card.events.last?.message == "moved inProgress → inReview"
+            && now.timeIntervalSince(card.events.last?.timestamp ?? .distantPast) < 10
+        guard card.launchedSessionId == sessionId || justReviewed else { return }
         var updated = cards[idx]
         updated.column = .ready
         updated.clearLaunchLinks()
         updated.record("agent exited with status \(exitCode) — back to Ready")
         cards[idx] = updated
+        scheduleSave()
+    }
+
+    /// A conversation reopened from the card (its original tab is gone):
+    /// remember the new tab for the badge / watch / reveal, WITHOUT making
+    /// it a launch — the column stays, and the exit handling that turns a
+    /// launch's early death into "back to Ready" must not fire for a tab the
+    /// user merely opened to look.
+    func linkReopenedSession(id: UUID, sessionId: UUID) {
+        guard let idx = cards.firstIndex(where: { $0.id == id }) else { return }
+        cards[idx].lastLaunchedSessionId = sessionId
+        cards[idx].record("conversation reopened")
         scheduleSave()
     }
 

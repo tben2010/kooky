@@ -24,6 +24,9 @@ struct KanbanBoardView: View {
     @State private var notice: Notice?
     @State private var noticeDismissal: Task<Void, Never>?
     @State private var launchingCardIds: Set<UUID> = []
+    /// Offset/extent of the narrow layout's horizontal scroller, for the
+    /// board's own always-visible indicator.
+    @State private var hScroll = HorizontalScrollModel()
 
     private struct Notice: Equatable {
         enum Tone { case info, failure }
@@ -158,6 +161,11 @@ struct KanbanBoardView: View {
 
     private static let minColumnWidth: CGFloat = 240
     private static let scrollColumnWidth: CGFloat = 260
+    /// Five fixed columns + hairlines + the row's horizontal padding.
+    private static var scrollContentWidth: CGFloat {
+        let count = CGFloat(KanbanColumn.allCases.count)
+        return count * scrollColumnWidth + (count - 1) + 24
+    }
 
     /// Five columns share the width when it's there; below the minimum
     /// they take a fixed width and the row scrolls sideways instead of
@@ -170,9 +178,17 @@ struct KanbanBoardView: View {
                 columnRow(width: nil)
                     .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
             } else {
-                ScrollView(.horizontal) {
+                // Narrow (split layout): fixed-width columns behind an
+                // always-visible horizontal scroller — SwiftUI's own
+                // indicator follows the system's auto-hide setting, which
+                // leaves no hint that Done exists off-screen.
+                HorizontalScrollHost(contentWidth: Self.scrollContentWidth, model: hScroll) {
                     columnRow(width: Self.scrollColumnWidth)
-                        .frame(height: proxy.size.height, alignment: .top)
+                }
+                .overlay(alignment: .bottom) {
+                    KanbanScrollIndicator(model: hScroll)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 6)
                 }
             }
         }
@@ -220,6 +236,7 @@ struct KanbanBoardView: View {
                             onWatch: { watch(card) },
                             onReveal: { reveal(card) },
                             onRelaunch: { relaunch(card) },
+                            onReopen: { reopen(card) },
                             onMove: { target in move(card.id, to: target) },
                             onDelete: { board.remove(id: card.id) }
                         )
@@ -288,13 +305,38 @@ struct KanbanBoardView: View {
         }
     }
 
+    /// The card's tab is gone but its conversation is on disk: resume it
+    /// in a new tab (kooky's own resume path), link the tab to the card,
+    /// and show it beside the board.
+    private func reopen(_ card: KanbanCard) {
+        guard let conversationId = card.conversationId,
+              let template = AgentTemplate.all.first(where: { $0.id == card.agentId }) else { return }
+        let cwd = card.worktreePath ?? card.projectRoot
+        switch store.resumeAgentSession(agentId: template.rosterId, conversationId: conversationId, cwd: cwd) {
+        case .success(let session):
+            board.linkReopenedSession(id: card.id, sessionId: session.id)
+            withAnimation(Theme.chromeTransition) {
+                if store.mainContent != .kanbanSplit { store.setMainContent(.kanbanSplit) }
+            }
+        case .failure(let refusal):
+            show(Notice(text: refusal.message(agentId: card.agentId, conversationId: conversationId), tone: .failure))
+        }
+    }
+
     private func reveal(_ card: KanbanCard) {
-        guard let sessionId = card.launchedSessionId else { return }
+        guard let sessionId = liveSessionId(for: card) else { return }
         board.revealSession(sessionId)
     }
 
+    /// The tab a card is (or was last) running in — `launchedSessionId` is
+    /// dropped when the card leaves In Progress, but the terminal usually
+    /// outlives that move, and the card must keep pointing at it.
+    private func liveSessionId(for card: KanbanCard) -> UUID? {
+        card.launchedSessionId ?? card.lastLaunchedSessionId
+    }
+
     private func liveStatus(for card: KanbanCard) -> KanbanLiveStatus? {
-        guard let sessionId = card.launchedSessionId,
+        guard let sessionId = liveSessionId(for: card),
               let hit = store.locateSession(sessionId) else { return nil }
         let watched = hit.store === store
             && store.activeWorkspaceId == hit.workspace.id
@@ -311,7 +353,7 @@ struct KanbanBoardView: View {
     /// split (if needed) and make the card's tab the active one beside it.
     /// Another window: hand off to the app-level reveal.
     private func watch(_ card: KanbanCard) {
-        guard let sessionId = card.launchedSessionId,
+        guard let sessionId = liveSessionId(for: card),
               let hit = store.locateSession(sessionId) else { return }
         guard hit.store === store else {
             board.revealSession(sessionId)
@@ -356,5 +398,153 @@ struct KanbanBoardView: View {
         if !userPickedProject, let root {
             selectedProject = root
         }
+    }
+}
+
+/// Live geometry of the narrow layout's horizontal scroll view — what the
+/// board's own indicator draws from, and the handle it scrolls through.
+@MainActor
+@Observable
+final class HorizontalScrollModel {
+    var offset: CGFloat = 0
+    var visibleWidth: CGFloat = 0
+    var contentWidth: CGFloat = 0
+    @ObservationIgnored weak var scrollView: NSScrollView?
+
+    var maxOffset: CGFloat { max(0, contentWidth - visibleWidth) }
+    var isScrollable: Bool { maxOffset > 1 }
+
+    func scroll(to x: CGFloat) {
+        guard let scrollView else { return }
+        let clamped = min(max(0, x), maxOffset)
+        scrollView.contentView.scroll(to: NSPoint(x: clamped, y: scrollView.contentView.bounds.origin.y))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+}
+
+/// `NSScrollView` hosting a SwiftUI row of fixed total width, scrollers
+/// off — the board draws its own indicator (`KanbanScrollIndicator`), which
+/// unlike the system's stays visible and matches the chrome. The document
+/// view's height follows the scroll view's content area so the columns
+/// fill the board vertically.
+private struct HorizontalScrollHost<Content: View>: NSViewRepresentable {
+    let contentWidth: CGFloat
+    let model: HorizontalScrollModel
+    @ViewBuilder let content: () -> Content
+
+    final class ScrollView: NSScrollView {
+        var contentWidth: CGFloat = 0
+        override func tile() {
+            super.tile()
+            guard let document = documentView else { return }
+            let size = NSSize(width: max(contentWidth, contentSize.width), height: contentSize.height)
+            if document.frame.size != size { document.setFrameSize(size) }
+        }
+    }
+
+    final class Coordinator {
+        var observer: NSObjectProtocol?
+        deinit { observer.map(NotificationCenter.default.removeObserver) }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> ScrollView {
+        let scroll = ScrollView()
+        scroll.hasHorizontalScroller = false
+        scroll.hasVerticalScroller = false
+        scroll.drawsBackground = false
+        scroll.horizontalScrollElasticity = .none
+        scroll.contentWidth = contentWidth
+        let hosting = NSHostingView(rootView: content())
+        hosting.autoresizingMask = []
+        scroll.documentView = hosting
+        scroll.contentView.postsBoundsChangedNotifications = true
+        let model = model
+        context.coordinator.observer = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification, object: scroll.contentView, queue: .main
+        ) { [weak scroll] _ in
+            MainActor.assumeIsolated {
+                guard let scroll else { return }
+                model.offset = scroll.contentView.bounds.origin.x
+                model.visibleWidth = scroll.contentSize.width
+                model.contentWidth = scroll.documentView?.frame.width ?? 0
+            }
+        }
+        model.scrollView = scroll
+        return scroll
+    }
+
+    func updateNSView(_ scroll: ScrollView, context: Context) {
+        scroll.contentWidth = contentWidth
+        (scroll.documentView as? NSHostingView<Content>)?.rootView = content()
+        scroll.tile()
+        let model = model
+        DispatchQueue.main.async {
+            model.offset = scroll.contentView.bounds.origin.x
+            model.visibleWidth = scroll.contentSize.width
+            model.contentWidth = scroll.documentView?.frame.width ?? 0
+        }
+    }
+}
+
+/// Brutalist horizontal scroll indicator: hairline track, muted knob,
+/// draggable. Always drawn while the content overflows — the whole point
+/// is that Done stays discoverable when the board sits beside a terminal.
+private struct KanbanScrollIndicator: View {
+    let model: HorizontalScrollModel
+    @State private var dragStartOffset: CGFloat?
+
+    private static let height: CGFloat = 8
+    private static let minKnob: CGFloat = 40
+
+    var body: some View {
+        GeometryReader { proxy in
+            let track = proxy.size.width
+            let knob = knobWidth(track: track)
+            let x = knobX(track: track, knob: knob)
+            ZStack(alignment: .leading) {
+                Rectangle()
+                    .fill(Theme.chromeHairline)
+                    .frame(height: 1)
+                    .frame(maxHeight: .infinity, alignment: .center)
+                Rectangle()
+                    .fill(Theme.chromeMuted.opacity(0.7))
+                    .frame(width: knob, height: Self.height)
+                    .offset(x: x)
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        if dragStartOffset == nil {
+                            // Click outside the knob jumps there; a drag then
+                            // continues from that position.
+                            let start = value.startLocation.x
+                            if start < x || start > x + knob {
+                                model.scroll(to: (start - knob / 2) / max(1, track - knob) * model.maxOffset)
+                            }
+                            dragStartOffset = model.offset
+                        }
+                        guard let base = dragStartOffset else { return }
+                        let ratio = model.maxOffset / max(1, track - knob)
+                        model.scroll(to: base + value.translation.width * ratio)
+                    }
+                    .onEnded { _ in dragStartOffset = nil }
+            )
+        }
+        .frame(height: Self.height)
+        .opacity(model.isScrollable ? 1 : 0)
+        .allowsHitTesting(model.isScrollable)
+    }
+
+    private func knobWidth(track: CGFloat) -> CGFloat {
+        guard model.contentWidth > 0 else { return track }
+        return max(Self.minKnob, min(track, track * model.visibleWidth / model.contentWidth))
+    }
+
+    private func knobX(track: CGFloat, knob: CGFloat) -> CGFloat {
+        guard model.maxOffset > 0 else { return 0 }
+        return (track - knob) * min(1, max(0, model.offset / model.maxOffset))
     }
 }

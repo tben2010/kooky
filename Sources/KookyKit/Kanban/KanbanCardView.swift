@@ -24,6 +24,8 @@ struct KanbanCardView: View {
     let onReveal: () -> Void
     /// In Progress without a live tab: start the agent again.
     let onRelaunch: () -> Void
+    /// No live tab but a saved conversation: reopen it in a new tab.
+    let onReopen: () -> Void
     let onMove: (KanbanColumn) -> Void
     let onDelete: () -> Void
 
@@ -44,7 +46,13 @@ struct KanbanCardView: View {
                     .lineLimit(3)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
-                statusDot
+                if live != nil {
+                    terminalBadge
+                } else if card.conversationId != nil, !isLaunching {
+                    reopenBadge
+                } else {
+                    statusDot
+                }
             }
             if !card.requirement.isEmpty {
                 Text(singleLine(card.requirement))
@@ -116,12 +124,58 @@ struct KanbanCardView: View {
         .onHover { isHovered = $0 }
         .onTapGesture(count: 2) { onOpen() }
         .onTapGesture(count: 1) {
-            if live != nil { onWatch() } else if card.column == .inProgress, !isLaunching { onRelaunch() }
+            if live != nil {
+                onWatch()
+            } else if card.conversationId != nil, !isLaunching {
+                onReopen()
+            } else if card.column == .inProgress, !isLaunching {
+                onRelaunch()
+            }
         }
         .contextMenu { contextMenu }
-        .help(card.launchedSessionId != nil
-              ? String(localized: "Double-click to edit · right-click to jump to the agent tab", bundle: bundle)
+        .help(live != nil
+              ? String(localized: "Click to show the terminal · double-click to edit", bundle: bundle)
               : String(localized: "Double-click to edit", bundle: bundle))
+    }
+
+    /// Top-right "a terminal is open for this card" mark — shown in every
+    /// column while the tab exists, tinted by the agent's state, filled
+    /// when that tab is the one on screen.
+    private var terminalBadge: some View {
+        let tint = live.map { color(for: $0.state) } ?? Theme.chromeMuted
+        return HStack(spacing: 4) {
+            Image(systemName: live?.isWatched == true ? "terminal.fill" : "terminal")
+                .font(.system(size: 10, weight: .medium))
+            Circle()
+                .fill(tint)
+                .frame(width: 6, height: 6)
+        }
+        .foregroundStyle(live?.isWatched == true ? Theme.activityRunning : Theme.chromeForeground.opacity(0.85))
+        .padding(.horizontal, 5)
+        .padding(.vertical, 3)
+        .background(tint.opacity(0.12))
+        .bracketBorder()
+        .help(String.localizedStringWithFormat(
+            String(localized: "Terminal open — %@ · click the card to show it", bundle: bundle),
+            live?.state.label ?? ""
+        ))
+    }
+
+    /// The tab is gone but the agent's conversation is on disk: a muted
+    /// terminal mark with a reopen arrow; click brings the conversation
+    /// back in a new tab.
+    private var reopenBadge: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "terminal")
+                .font(.system(size: 10, weight: .medium))
+            Image(systemName: "arrow.counterclockwise")
+                .font(.system(size: 8, weight: .semibold))
+        }
+        .foregroundStyle(Theme.chromeMuted)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 3)
+        .bracketBorder()
+        .help(String(localized: "Terminal closed — conversation saved · click the card to reopen it", bundle: bundle))
     }
 
     /// "● running · 12 min · make test" — the line that answers "is it
@@ -151,7 +205,9 @@ struct KanbanCardView: View {
                     .foregroundStyle(Theme.chromeMuted)
             } else {
                 Circle().stroke(Theme.chromeMuted, lineWidth: 1).frame(width: 6, height: 6)
-                Text(String(localized: "no live agent tab", bundle: bundle))
+                Text(card.conversationId != nil
+                     ? String(localized: "terminal closed · click to reopen the conversation", bundle: bundle)
+                     : String(localized: "no live agent tab", bundle: bundle))
                     .foregroundStyle(Theme.chromeMuted.opacity(0.8))
             }
         }
@@ -200,9 +256,12 @@ struct KanbanCardView: View {
     @ViewBuilder
     private var contextMenu: some View {
         Button(String(localized: "Edit…", bundle: bundle)) { onOpen() }
-        if card.launchedSessionId != nil, live != nil {
+        if live != nil {
             Button(String(localized: "Watch Agent", bundle: bundle)) { onWatch() }
             Button(String(localized: "Open Agent Tab", bundle: bundle)) { onReveal() }
+        }
+        if live == nil, card.conversationId != nil, !isLaunching {
+            Button(String(localized: "Reopen Conversation", bundle: bundle)) { onReopen() }
         }
         if card.column == .inProgress, live == nil, !isLaunching {
             Button(String(localized: "Relaunch Agent", bundle: bundle)) { onRelaunch() }
