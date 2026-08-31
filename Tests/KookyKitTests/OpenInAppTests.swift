@@ -91,4 +91,61 @@ final class OpenInAppTests: XCTestCase {
     func testEffectiveDefaultNilWhenNothingVisible() {
         XCTAssertNil(OpenInApp.effectiveDefault(lastUsedId: "vscode", visible: []))
     }
+
+    // MARK: - projectTarget (workspace file beats folder)
+
+    private func makeProjectDir(_ entries: [String]) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("openin-\(UUID().uuidString)/MyApp", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for entry in entries {
+            let url = dir.appendingPathComponent(entry)
+            if entry.hasSuffix("/") {
+                try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            } else {
+                try Data().write(to: url)
+            }
+        }
+        return dir
+    }
+
+    func testVSCodeOpensTheCodeWorkspaceFileWhenPresent() throws {
+        let dir = try makeProjectDir(["MyApp.code-workspace", "README.md", "src/"])
+        defer { try? FileManager.default.removeItem(at: dir.deletingLastPathComponent()) }
+        for id in ["vscode", "cursor", "windsurf", "kiro"] {
+            XCTAssertEqual(OpenInResolver.projectTarget(for: dir, app: app(id)).lastPathComponent, "MyApp.code-workspace", id)
+        }
+    }
+
+    func testFolderWithoutWorkspaceFileOpensAsFolder() throws {
+        let dir = try makeProjectDir(["README.md", "src/"])
+        defer { try? FileManager.default.removeItem(at: dir.deletingLastPathComponent()) }
+        XCTAssertEqual(OpenInResolver.projectTarget(for: dir, app: app("vscode")), dir)
+        XCTAssertEqual(OpenInResolver.projectTarget(for: URL(fileURLWithPath: "/nonexistent-\(UUID().uuidString)"), app: app("vscode")).lastPathComponent.hasPrefix("nonexistent"), true)
+    }
+
+    func testWorkspaceNamedAfterFolderWinsElseAlphabetical() throws {
+        let dir = try makeProjectDir(["zeta.code-workspace", "MyApp.code-workspace", "alpha.code-workspace"])
+        defer { try? FileManager.default.removeItem(at: dir.deletingLastPathComponent()) }
+        XCTAssertEqual(OpenInResolver.projectTarget(for: dir, app: app("vscode")).lastPathComponent, "MyApp.code-workspace")
+        try FileManager.default.removeItem(at: dir.appendingPathComponent("MyApp.code-workspace"))
+        XCTAssertEqual(OpenInResolver.projectTarget(for: dir, app: app("vscode")).lastPathComponent, "alpha.code-workspace")
+    }
+
+    func testXcodePrefersWorkspaceOverProjectAndOthersIgnoreWorkspaceFiles() throws {
+        let dir = try makeProjectDir(["MyApp.xcodeproj/", "MyApp.xcworkspace/", "MyApp.code-workspace"])
+        defer { try? FileManager.default.removeItem(at: dir.deletingLastPathComponent()) }
+        XCTAssertEqual(OpenInResolver.projectTarget(for: dir, app: app("xcode")).lastPathComponent, "MyApp.xcworkspace")
+        try FileManager.default.removeItem(at: dir.appendingPathComponent("MyApp.xcworkspace"))
+        XCTAssertEqual(OpenInResolver.projectTarget(for: dir, app: app("xcode")).lastPathComponent, "MyApp.xcodeproj")
+        // Terminals, Finder, Zed: the folder, always.
+        for id in ["terminal", "finder", "zed", "sublime"] {
+            XCTAssertEqual(OpenInResolver.projectTarget(for: dir, app: app(id)), dir, id)
+        }
+    }
+
+    func testHiddenWorkspaceFilesAreIgnored() throws {
+        let dir = try makeProjectDir([".hidden.code-workspace"])
+        defer { try? FileManager.default.removeItem(at: dir.deletingLastPathComponent()) }
+        XCTAssertEqual(OpenInResolver.projectTarget(for: dir, app: app("vscode")), dir)
+    }
 }
