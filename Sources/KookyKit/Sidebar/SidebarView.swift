@@ -634,17 +634,12 @@ struct SidebarView: View {
         }
     }
 
-    /// Right-click → "New Kanban Card…": resolve the workspace's repo root
-    /// off-main (git subprocess), hand it to the board, and bring the board
-    /// up if the window is showing terminals.
+    /// Right-click → "New Kanban Card…". One implementation with the
+    /// command palette's entry: `KanbanLaunchCoordinator.presentNewCard`
+    /// resolves the repo root and hands it to the board.
     private func presentNewCard(_ workspace: Workspace) {
         Task { @MainActor in
-            let root = await KanbanLaunchCoordinator.projectRoot(for: workspace, in: store)
-                ?? workspace.workingDirectory.standardizedFileURL
-            store.pendingNewCardProjectRoot = root
-            if store.mainContent == .terminals {
-                withAnimation(Theme.chromeTransition) { store.toggleKanban() }
-            }
+            await KanbanLaunchCoordinator.presentNewCard(for: workspace, in: store)
         }
     }
 

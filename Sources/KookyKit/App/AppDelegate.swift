@@ -1420,7 +1420,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 return PaletteIndex.build(
                     controllers: self.windowControllers,
                     model: KookySettingsModel.shared,
-                    recentFolders: RecentFolders.shared.existing
+                    recentFolders: RecentFolders.shared.existing,
+                    activeWorkspace: self.activeStore?.active
                 )
             },
             anchor: activeController?.window,
@@ -1475,6 +1476,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             guard let store = activeStore, !store.mainContent.showsKanban else { return }
             withAnimation(Theme.chromeTransition) {
                 store.toggleKanban()
+            }
+        case .newKanbanCard:
+            // Same path as the sidebar's context-menu entry; the index only
+            // offers this row while the active workspace is a git checkout.
+            guard let store = activeStore, let ws = store.active else { return }
+            Task { @MainActor in
+                await KanbanLaunchCoordinator.presentNewCard(for: ws, in: store)
             }
         }
     }

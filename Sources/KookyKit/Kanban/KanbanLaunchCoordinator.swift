@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 /// What the card editor and the launch need to know about a card's repo:
 /// which branch the main checkout is on, which branches exist, and which
@@ -93,6 +94,21 @@ enum KanbanLaunchCoordinator {
         return await Task.detached(priority: .userInitiated) {
             WorktreeManager.repoRoot(near: cwd)?.standardizedFileURL
         }.value
+    }
+
+    /// Sidebar right-click and command palette "New Kanban Card…" share
+    /// this: resolve the workspace's repo root off-main (git subprocess),
+    /// park it on the store for the board's editor, and bring the board up
+    /// if the window is showing terminals. The board consumes the pending
+    /// root on appear / change and opens the editor with it — so the board
+    /// needn't be visible before the request.
+    static func presentNewCard(for workspace: Workspace, in store: WorkspaceStore) async {
+        let root = await projectRoot(for: workspace, in: store)
+            ?? workspace.workingDirectory.standardizedFileURL
+        store.pendingNewCardProjectRoot = root
+        if store.mainContent == .terminals {
+            withAnimation(Theme.chromeTransition) { store.toggleKanban() }
+        }
     }
 
     /// Sibling directory next to the repo, `<repo>-<branch-slug>` — the same

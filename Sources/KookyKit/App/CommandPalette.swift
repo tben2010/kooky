@@ -62,6 +62,10 @@ enum PaletteItemKind: Hashable, Sendable {
     case openRecentFolder(path: String)
     /// Show the Kanban board in the active window.
     case kanbanBoard
+    /// Open the card editor for the active workspace's repository — the
+    /// board comes up as part of the flow, it needn't be visible first.
+    /// Offered only while the active workspace is a local git checkout.
+    case newKanbanCard
 }
 
 struct PaletteItem: Identifiable, Hashable {
@@ -82,6 +86,7 @@ enum PaletteIndex {
         controllers: [KookyWindowController],
         model: KookySettingsModel,
         recentFolders: [URL] = [],
+        activeWorkspace: Workspace? = nil,
         bundle: Bundle = .kookyResources
     ) -> [PaletteItem] {
         var items: [PaletteItem] = []
@@ -166,6 +171,20 @@ enum PaletteIndex {
             symbol: "rectangle.split.3x1",
             iconAsset: nil
         ))
+        // "New Kanban Card…" needs a repo to file the card under, so it
+        // only shows while the active workspace is a local git checkout —
+        // the same gate the sidebar's context menu applies (no SSH, and a
+        // `.git` within reach, which also covers worktree children).
+        if let activeWorkspace, Self.offersNewKanbanCard(for: activeWorkspace) {
+            items.append(PaletteItem(
+                id: "new-kanban-card",
+                title: String(localized: "New Kanban Card…", bundle: bundle),
+                subtitle: String(localized: "card in Backlog for the active workspace", bundle: bundle),
+                kind: .newKanbanCard,
+                symbol: "plus.rectangle.on.rectangle",
+                iconAsset: nil
+            ))
+        }
         // Recent project folders — skip ones already open as a workspace
         // (their workspace entry above is the better jump target).
         let openPaths = Set(controllers.flatMap { controller in
@@ -184,6 +203,13 @@ enum PaletteIndex {
             ))
         }
         return items
+    }
+
+    /// Whether `workspace` can take a Kanban card: a local (non-SSH)
+    /// workspace whose working directory sits inside a git repository.
+    static func offersNewKanbanCard(for workspace: Workspace) -> Bool {
+        workspace.sshRemoteHost == nil
+            && GitWatcher.findGitDir(near: workspace.workingDirectory) != nil
     }
 
     /// Rank items by fuzzy score against `query`. Empty query returns the
