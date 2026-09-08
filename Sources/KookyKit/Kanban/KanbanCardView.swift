@@ -28,6 +28,13 @@ struct KanbanCardView: View {
     let onReopen: () -> Void
     let onMove: (KanbanColumn) -> Void
     let onDelete: () -> Void
+    /// Entry in the board's archive section: read-only — no drag, no move,
+    /// no delete, single click does nothing; the menu offers "restore".
+    var isArchived: Bool = false
+    /// Done card: take it off the board. nil hides the menu entry.
+    var onArchive: (() -> Void)? = nil
+    /// Archived card: back to Done.
+    var onUnarchive: (() -> Void)? = nil
 
     @State private var isHovered = false
 
@@ -97,6 +104,14 @@ struct KanbanCardView: View {
                 Text("\(card.effectiveCriteria.count) AC")
                     .font(Theme.mono(9.5))
                     .foregroundStyle(Theme.chromeMuted.opacity(0.7))
+                if isArchived {
+                    Text(String(localized: "archived", bundle: bundle))
+                        .font(Theme.mono(9.5))
+                        .foregroundStyle(Theme.chromeMuted.opacity(0.8))
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .bracketBorder()
+                }
             }
             if card.column != .backlog || !card.branchName.isEmpty {
                 HStack(spacing: 4) {
@@ -124,6 +139,7 @@ struct KanbanCardView: View {
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(isHovered ? Theme.chromeHover : Theme.chromeActive.opacity(0.35))
+        .opacity(isArchived ? 0.7 : 1)
         .bracketBorder()
         .overlay {
             if live?.isWatched == true {
@@ -134,6 +150,7 @@ struct KanbanCardView: View {
         .onHover { isHovered = $0 }
         .onTapGesture(count: 2) { onOpen() }
         .onTapGesture(count: 1) {
+            guard !isArchived else { return }
             if live != nil {
                 onWatch()
             } else if card.conversationId != nil, !isLaunching {
@@ -143,7 +160,9 @@ struct KanbanCardView: View {
             }
         }
         .contextMenu { contextMenu }
-        .help(live != nil
+        .help(isArchived
+              ? String(localized: "Archived · double-click to view", bundle: bundle)
+              : live != nil
               ? String(localized: "Click to show the terminal · double-click to edit", bundle: bundle)
               : String(localized: "Double-click to edit", bundle: bundle))
     }
@@ -265,6 +284,17 @@ struct KanbanCardView: View {
 
     @ViewBuilder
     private var contextMenu: some View {
+        if isArchived {
+            Button(String(localized: "View…", bundle: bundle)) { onOpen() }
+            Divider()
+            Button(String(localized: "Restore to Done", bundle: bundle)) { onUnarchive?() }
+        } else {
+            liveContextMenu
+        }
+    }
+
+    @ViewBuilder
+    private var liveContextMenu: some View {
         Button(String(localized: "Edit…", bundle: bundle)) { onOpen() }
         if live != nil {
             Button(String(localized: "Watch Agent", bundle: bundle)) { onWatch() }
@@ -284,6 +314,9 @@ struct KanbanCardView: View {
             }
         }
         Divider()
+        if card.column == .done, let onArchive {
+            Button(String(localized: "Archive Card", bundle: bundle)) { onArchive() }
+        }
         Button(String(localized: "Delete Card", bundle: bundle), role: .destructive) { onDelete() }
     }
 }

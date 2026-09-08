@@ -139,6 +139,20 @@ final class KookySettingsModelTests: XCTestCase {
         }.first)
     }
 
+    func testKanbanAutoArchiveDefaultsOffAndDaysFallBackToDefault() {
+        let model = KookySettingsModel()
+        XCTAssertFalse(model.kanbanAutoArchiveEnabled)
+        XCTAssertNil(model.effectiveKanbanAutoArchiveDays)
+        XCTAssertEqual(KookySettingsModel.resolvedKanbanAutoArchiveDays(nil), KookySettingsModel.defaultKanbanAutoArchiveDays)
+        XCTAssertEqual(KookySettingsModel.resolvedKanbanAutoArchiveDays(0), KookySettingsModel.defaultKanbanAutoArchiveDays)
+        XCTAssertEqual(KookySettingsModel.resolvedKanbanAutoArchiveDays(-3), KookySettingsModel.defaultKanbanAutoArchiveDays)
+        XCTAssertEqual(KookySettingsModel.resolvedKanbanAutoArchiveDays("14"), KookySettingsModel.defaultKanbanAutoArchiveDays)
+        XCTAssertEqual(KookySettingsModel.resolvedKanbanAutoArchiveDays(14), 14)
+        model.kanbanAutoArchiveEnabled = true
+        model.kanbanAutoArchiveDays = 14
+        XCTAssertEqual(model.effectiveKanbanAutoArchiveDays, 14)
+    }
+
     func testShowSearchPillDefaultsToVisible() {
         XCTAssertTrue(
             KookySettingsModel.resolvedShowSearchPill(

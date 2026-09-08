@@ -6,16 +6,28 @@ import Foundation
 protocol KanbanPersistence {
     func load() -> [KanbanCard]?
     func save(_ cards: [KanbanCard])
+    /// Archived (Done, then archived) cards — `archive.json`. nil when no
+    /// archive has been written yet; the store treats that as empty.
+    func loadArchive() -> [KanbanCard]?
+    func saveArchive(_ cards: [KanbanCard])
 }
 
 /// `board.json` beside `state.json`. A separate file on purpose: the
 /// board is app-wide while `state.json` is sliced per window, and keeping
 /// the card schema out of `PersistedApp` means upstream changes to the
 /// window state never collide with the fork's board format.
+///
+/// Archived cards live in `archive.json` next to it — same envelope, its
+/// own file, so the board file stays small however long the archive
+/// grows and a corrupt archive never takes the live board down with it.
 @MainActor
 struct FileKanbanPersistence: KanbanPersistence {
     static var defaultFileURL: URL {
         AppPersistence.dataDirectory.appendingPathComponent("board.json")
+    }
+
+    static var defaultArchiveFileURL: URL {
+        AppPersistence.dataDirectory.appendingPathComponent("archive.json")
     }
 
     /// Versioned envelope so a future shape change can branch on `version`
@@ -27,24 +39,35 @@ struct FileKanbanPersistence: KanbanPersistence {
     }
 
     let fileURL: URL
+    let archiveFileURL: URL
 
-    init(fileURL: URL = FileKanbanPersistence.defaultFileURL) {
+    /// `archiveFileURL` defaults to `archive.json` beside `fileURL`, so a
+    /// test pointing the board at a temp directory gets its archive there
+    /// too.
+    init(fileURL: URL = FileKanbanPersistence.defaultFileURL, archiveFileURL: URL? = nil) {
         self.fileURL = fileURL
+        self.archiveFileURL = archiveFileURL
+            ?? fileURL.deletingLastPathComponent().appendingPathComponent("archive.json")
     }
 
-    func load() -> [KanbanCard]? {
-        guard let data = try? Data(contentsOf: fileURL) else { return nil }
+    func load() -> [KanbanCard]? { read(from: fileURL) }
+    func save(_ cards: [KanbanCard]) { write(cards, to: fileURL) }
+    func loadArchive() -> [KanbanCard]? { read(from: archiveFileURL) }
+    func saveArchive(_ cards: [KanbanCard]) { write(cards, to: archiveFileURL) }
+
+    private func read(from url: URL) -> [KanbanCard]? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return (try? decoder.decode(Envelope.self, from: data))?.cards
     }
 
-    func save(_ cards: [KanbanCard]) {
+    private func write(_ cards: [KanbanCard], to url: URL) {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(Envelope(version: Envelope.currentVersion, cards: cards)) else { return }
-        try? data.write(to: fileURL, options: .atomic)
+        try? data.write(to: url, options: .atomic)
     }
 }
 
@@ -69,12 +92,20 @@ final class KanbanStore {
     }
 
     private(set) var cards: [KanbanCard] = []
+    /// Cards taken off the board from Done. Not in `cards` — every board
+    /// query, project filter and launch path sees only live cards; the
+    /// archive is read through `archivedCard(id:)` / `archivedCards(project:)`.
+    /// Oldest first (append order); the board shows it newest first.
+    private(set) var archived: [KanbanCard] = []
     /// Cross-window "jump to this tab" — the board can't front another
     /// window itself, so `AppDelegate` installs its `revealTab` here at
     /// launch. Default no-op keeps tests and previews self-contained.
     @ObservationIgnored var revealSession: @MainActor (UUID) -> Void = { _ in }
     private let persistence: any KanbanPersistence
     private var pendingSave: Task<Void, Never>?
+    /// The archive changes rarely; it's only rewritten when it did.
+    private var archiveDirty = false
+    private var autoArchiveTask: Task<Void, Never>?
     /// Same 1s debounce as `WorkspaceStore` — typing in the editor must
     /// not hit disk per keystroke.
     private static let saveDebounce: UInt64 = 1_000_000_000
@@ -83,6 +114,7 @@ final class KanbanStore {
     init(persistence: any KanbanPersistence) {
         self.persistence = persistence
         cards = persistence.load() ?? []
+        archived = persistence.loadArchive() ?? []
     }
 
     // MARK: Queries
@@ -98,11 +130,97 @@ final class KanbanStore {
         }
     }
 
-    /// Distinct project roots across every card, for the board's filter.
+    /// Distinct project roots across every live card, for the board's
+    /// filter. Archived cards don't count — a repo whose every card is
+    /// archived leaves the picker until the archive is shown.
     var projectRoots: [URL] {
+        projectRoots(includingArchived: false)
+    }
+
+    func projectRoots(includingArchived: Bool) -> [URL] {
         var seen: Set<String> = []
-        return cards.compactMap { card in
+        return (includingArchived ? cards + archived : cards).compactMap { card in
             seen.insert(card.projectRoot.path).inserted ? card.projectRoot : nil
+        }
+    }
+
+    // MARK: Archive
+
+    func archivedCard(id: UUID) -> KanbanCard? {
+        archived.first { $0.id == id }
+    }
+
+    /// Archived cards of one project (nil = every project), oldest first.
+    func archivedCards(project: URL? = nil) -> [KanbanCard] {
+        let key = project?.standardizedFileURL.path
+        return archived.filter { key == nil || $0.projectRoot.path == key }
+    }
+
+    /// Take a Done card off the board into the archive. Only Done cards
+    /// qualify — archiving is "this is finished and I'm done looking at
+    /// it", not a way to hide unfinished work. Nothing else changes: the
+    /// worktree pin, branch and history travel with the card so a restore
+    /// puts back exactly what left.
+    @discardableResult
+    func archive(id: UUID, now: Date = Date()) -> Bool {
+        guard let idx = cards.firstIndex(where: { $0.id == id }), cards[idx].column == .done else { return false }
+        var card = cards.remove(at: idx)
+        card.record("archived", now: now)
+        archived.append(card)
+        scheduleSave(archive: true)
+        return true
+    }
+
+    /// Back to Done. The column is forced to Done regardless of what the
+    /// archived copy says — the archive only ever holds Done cards, and a
+    /// restore must never resurrect a card into In Progress.
+    @discardableResult
+    func unarchive(id: UUID, now: Date = Date()) -> Bool {
+        guard let idx = archived.firstIndex(where: { $0.id == id }) else { return false }
+        var card = archived.remove(at: idx)
+        card.column = .done
+        card.record("unarchived", now: now)
+        cards.append(card)
+        scheduleSave(archive: true)
+        return true
+    }
+
+    /// Archive every Done card of `project` (nil = all projects). Returns
+    /// how many moved.
+    @discardableResult
+    func archiveAllDone(project: URL?, now: Date = Date()) -> Int {
+        let ids = cards(in: .done, project: project).map(\.id)
+        for id in ids { archive(id: id, now: now) }
+        return ids.count
+    }
+
+    /// The "archive Done cards after N days" sweep: a Done card whose last
+    /// history entry is older than `days` goes to the archive. The last
+    /// event, not `updatedAt`, so a note added yesterday keeps the card
+    /// on the board. Returns how many moved.
+    @discardableResult
+    func autoArchive(doneOlderThan days: Int, now: Date = Date()) -> Int {
+        guard days > 0 else { return 0 }
+        let cutoff = now.addingTimeInterval(-TimeInterval(days) * 86_400)
+        let stale = cards.filter { card in
+            card.column == .done && (card.events.last?.timestamp ?? card.updatedAt) < cutoff
+        }
+        for card in stale { archive(id: card.id, now: now) }
+        return stale.count
+    }
+
+    /// Run the auto-archive sweep now and once a day from then on. `days`
+    /// is read on every tick (nil = the setting is off), so a change in
+    /// Settings applies at the next tick without a restart.
+    static let autoArchiveInterval: TimeInterval = 24 * 3_600
+    func startAutoArchive(days: @escaping @MainActor () -> Int?) {
+        autoArchiveTask?.cancel()
+        autoArchiveTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                if let days = days() { self.autoArchive(doneOlderThan: days) }
+                try? await Task.sleep(nanoseconds: UInt64(Self.autoArchiveInterval) * 1_000_000_000)
+            }
         }
     }
 
@@ -308,14 +426,23 @@ final class KanbanStore {
         pendingSave?.cancel()
         pendingSave = nil
         persistence.save(cards)
+        if archiveDirty {
+            persistence.saveArchive(archived)
+            archiveDirty = false
+        }
     }
 
-    private func scheduleSave() {
+    private func scheduleSave(archive: Bool = false) {
+        if archive { archiveDirty = true }
         pendingSave?.cancel()
         pendingSave = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: Self.saveDebounce)
             guard let self, !Task.isCancelled else { return }
             self.persistence.save(self.cards)
+            if self.archiveDirty {
+                self.persistence.saveArchive(self.archived)
+                self.archiveDirty = false
+            }
         }
     }
 }

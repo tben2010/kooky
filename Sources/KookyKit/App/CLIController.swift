@@ -219,10 +219,18 @@ final class KookyCLIController {
             guard let id = UUID(uuidString: raw) else {
                 return completion(refuse("--id expects a card UUID"))
             }
-            guard let found = board.card(id: id) else {
+            if let found = board.card(id: id) {
+                card = found
+            } else if let archivedCard = board.archivedCard(id: id) {
+                // An archived card is still a fact an agent may ask about,
+                // but not something to move or annotate from a shell.
+                guard request.cardAction == "show" else {
+                    return completion(refuse("card \"\(archivedCard.title)\" is archived — restore it from the board's archive first"))
+                }
+                return completion(ok(note: Self.renderCard(archivedCard, archived: true)))
+            } else {
                 return completion(refuse("no card with id \(id.uuidString)"))
             }
-            card = found
         } else if let raw = request.surface, let surface = UUID(uuidString: raw) {
             guard let found = board.card(launchedSession: surface) else {
                 return completion(refuse("this tab was not launched from a Kanban card — pass --id <card-uuid>"))
@@ -346,11 +354,12 @@ final class KookyCLIController {
 
     /// Plain-text card summary for `card --show` — what an agent reads
     /// back to re-orient itself.
-    static func renderCard(_ card: KanbanCard) -> String {
+    static func renderCard(_ card: KanbanCard, archived: Bool = false) -> String {
         var lines: [String] = []
         lines.append("card \(card.id.uuidString)")
         lines.append("title: \(card.title)")
         lines.append("column: \(card.column.rawValue)")
+        if archived { lines.append("archived: yes") }
         lines.append("branch: \(card.branchName)")
         if let worktree = card.worktreePath { lines.append("worktree: \(worktree.path)") }
         lines.append("agent: \(card.agentId)\(card.model.map { " (\($0))" } ?? "")")

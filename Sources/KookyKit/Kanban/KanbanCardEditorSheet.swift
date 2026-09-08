@@ -7,9 +7,16 @@ import UniformTypeIdentifiers
 /// what to take (never the column — drags own that).
 struct KanbanCardEditorSheet: View {
     let isNew: Bool
+    /// Archived card: every field disabled, no save — the only actions are
+    /// "restore to done" and "close".
+    let isReadOnly: Bool
     let save: (KanbanCard) -> Void
     /// nil hides the delete button (new cards have nothing to delete).
     let delete: (() -> Void)?
+    /// Done card only: take it off the board. nil hides the button.
+    let archive: (() -> Void)?
+    /// Read-only (archived) card: put it back in Done. nil hides the button.
+    let restore: (() -> Void)?
     let dismiss: () -> Void
 
     @State private var draft: KanbanCard
@@ -41,13 +48,19 @@ struct KanbanCardEditorSheet: View {
     init(
         card: KanbanCard,
         isNew: Bool,
+        isReadOnly: Bool = false,
         save: @escaping (KanbanCard) -> Void,
         delete: (() -> Void)?,
+        archive: (() -> Void)? = nil,
+        restore: (() -> Void)? = nil,
         dismiss: @escaping () -> Void
     ) {
         self.isNew = isNew
+        self.isReadOnly = isReadOnly
         self.save = save
         self.delete = delete
+        self.archive = archive
+        self.restore = restore
         self.dismiss = dismiss
         _draft = State(initialValue: card)
         originalAttachments = card.attachments
@@ -163,17 +176,30 @@ struct KanbanCardEditorSheet: View {
                 .frame(width: 32, height: 1)
                 .padding(.vertical, 22)
             form
+                .disabled(isReadOnly)
             issues
             HStack(spacing: 10) {
-                if let delete {
-                    BracketButton("delete") { delete() }
-                        .foregroundStyle(Theme.activityFailure)
+                if isReadOnly {
+                    if let restore {
+                        BracketButton("restore to done") { restore() }
+                    }
+                    Spacer()
+                    BracketButton("close") { dismiss() }
+                } else {
+                    if let delete {
+                        BracketButton("delete") { delete() }
+                            .foregroundStyle(Theme.activityFailure)
+                    }
+                    if let archive, draft.column == .done {
+                        BracketButton("archive") { archive() }
+                            .help(String(localized: "Take the card off the board — it stays in the archive with its history", bundle: bundle))
+                    }
+                    Spacer()
+                    BracketButton("cancel") { cancel() }
+                    BracketButton(isNew ? "create" : "save") { submit() }
+                        .disabled(!canSubmit)
+                        .opacity(canSubmit ? 1 : 0.4)
                 }
-                Spacer()
-                BracketButton("cancel") { cancel() }
-                BracketButton(isNew ? "create" : "save") { submit() }
-                    .disabled(!canSubmit)
-                    .opacity(canSubmit ? 1 : 0.4)
             }
             .padding(.top, 22)
         }
@@ -211,7 +237,7 @@ struct KanbanCardEditorSheet: View {
     // MARK: Sections
 
     private var statusLabel: some View {
-        Text(String(localized: isNew ? "NEW-CARD" : "EDIT-CARD", bundle: bundle))
+        Text(String(localized: isReadOnly ? "ARCHIVED-CARD" : isNew ? "NEW-CARD" : "EDIT-CARD", bundle: bundle))
             .font(Theme.mono(10, weight: .medium))
             .tracking(1.6)
             .foregroundStyle(Theme.chromeMuted.opacity(0.85))

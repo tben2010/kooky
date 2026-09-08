@@ -134,6 +134,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         KanbanStore.shared.revealSession = { [weak self] sessionId in
             self?.revealSessionForKanban(sessionId)
         }
+        // Done cards older than the configured age leave the board on their
+        // own — at launch, then daily. A no-op until the user turns it on.
+        KanbanStore.shared.startAutoArchive { settings.effectiveKanbanAutoArchiveDays }
         systemAppearanceObservation = NSApp.observe(
             \.effectiveAppearance,
             options: [.new]

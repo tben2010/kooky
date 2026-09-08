@@ -357,8 +357,9 @@ extension KookyHookKit {
                                   agent (like dragging it there);
                                   --done moves the card to In Review,
                                   --note appends to its history, --show
-                                  prints it. Inside a kooky tab the card
-                                  is found from the tab; --id overrides.
+                                  prints it (an archived card shows
+                                  "archived: yes"). Inside a kooky tab the
+                                  card is found from the tab; --id overrides.
           card --new --title <title> [--requirement <text> | --requirement-file <path>]
                [--criteria <one per line>] [--cwd <dir>] [--agent <template-id>]
                [--branch <name>]

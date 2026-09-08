@@ -110,6 +110,31 @@ final class KanbanPhase2Tests: XCTestCase {
         XCTAssertTrue(text.contains("- tests are green"), text)
     }
 
+    func testCardShowFindsArchivedCardsAndOtherVerbsRefuseThem() async {
+        let store = makeTestStore()
+        let board = KanbanStore(persistence: InMemoryKanbanPersistence())
+        let (card, _) = launchedCard(store: store, board: board)
+        board.move(card.id, to: .done)
+        XCTAssertTrue(board.archive(id: card.id))
+        let controller = makeController(store: store, board: board)
+
+        let shown = await respond(controller, KookyCLIRequest(verb: .card, cardAction: "show", cardId: card.id.uuidString))
+        XCTAssertTrue(shown.ok)
+        let text = shown.note ?? ""
+        XCTAssertTrue(text.contains("title: Card"), text)
+        XCTAssertTrue(text.contains("column: done"), text)
+        XCTAssertTrue(text.contains("archived: yes"), text)
+
+        let noted = await respond(controller, KookyCLIRequest(verb: .card, cardAction: "note", cardId: card.id.uuidString, note: "late"))
+        XCTAssertFalse(noted.ok)
+        XCTAssertTrue(noted.error?.contains("archived") == true, noted.error ?? "")
+        XCTAssertNil(board.archivedCard(id: card.id)?.events.last(where: { $0.message == "note: late" }))
+
+        let done = await respond(controller, KookyCLIRequest(verb: .card, cardAction: "done", cardId: card.id.uuidString))
+        XCTAssertFalse(done.ok)
+        XCTAssertNotNil(board.archivedCard(id: card.id), "still archived")
+    }
+
     func testCardRefusalsAreReadable() async {
         let store = makeTestStore()
         let board = KanbanStore(persistence: InMemoryKanbanPersistence())

@@ -19,7 +19,15 @@ struct KanbanBoardView: View {
     @State private var activeProjectRoot: URL?
     @State private var activeProjectResolved = false
     @State private var editingCard: KanbanCard?
+    /// Archived card opened for reading — a separate slot from
+    /// `editingCard` so the sheet knows it's read-only.
+    @State private var viewingArchivedCard: KanbanCard?
     @State private var isCreatingCard = false
+    /// "show archive": archived cards of the current project filter appear
+    /// read-only under Done. Per window, not persisted — the archive is
+    /// something you look into, not a mode you live in.
+    @State private var showArchive = false
+    @State private var confirmArchiveAll = false
     @State private var dropTargetColumn: KanbanColumn?
     @State private var notice: Notice?
     @State private var noticeDismissal: Task<Void, Never>?
@@ -56,8 +64,33 @@ struct KanbanBoardView: View {
                 isNew: false,
                 save: { edited in board.update(edited); editingCard = nil },
                 delete: { board.remove(id: card.id); editingCard = nil },
+                archive: card.column == .done ? { archive(card.id); editingCard = nil } : nil,
                 dismiss: { editingCard = nil }
             )
+        }
+        .sheet(item: $viewingArchivedCard) { card in
+            KanbanCardEditorSheet(
+                card: card,
+                isNew: false,
+                isReadOnly: true,
+                save: { _ in },
+                delete: nil,
+                restore: { unarchive(card.id); viewingArchivedCard = nil },
+                dismiss: { viewingArchivedCard = nil }
+            )
+        }
+        .confirmationDialog(
+            String.localizedStringWithFormat(
+                String(localized: "Archive %d Done cards?", bundle: bundle),
+                doneCardsInFilter.count
+            ),
+            isPresented: $confirmArchiveAll,
+            titleVisibility: .visible
+        ) {
+            Button(String(localized: "Archive", bundle: bundle)) { performArchiveAll() }
+            Button(String(localized: "Cancel", bundle: bundle), role: .cancel) {}
+        } message: {
+            Text(String(localized: "They leave the board and keep their history in the archive. \"show archive\" lists them; a card can be restored to Done from there.", bundle: bundle))
         }
         .sheet(isPresented: $isCreatingCard) {
             KanbanCardEditorSheet(
@@ -100,6 +133,13 @@ struct KanbanBoardView: View {
                 .help(canCreateCard
                       ? String(localized: "Add a card to this project", bundle: bundle)
                       : String(localized: "Open a git repository as a workspace first", bundle: bundle))
+            BracketButton(showArchive ? "hide archive" : "show archive") {
+                withAnimation(Theme.chromeTransition) { showArchive.toggle() }
+            }
+            .help(String.localizedStringWithFormat(
+                String(localized: "%d archived cards — shown read-only under Done", bundle: bundle),
+                board.archived.count
+            ))
             // Split ↔ full: the terminal beside the board is the real pane
             // host, so "watch the agent" is just "activate its tab".
             BracketButton(store.mainContent == .kanbanSplit ? "hide terminal" : "show terminal") {
@@ -148,7 +188,7 @@ struct KanbanBoardView: View {
     /// Every project a card belongs to plus the active workspace's — so a
     /// fresh repo without cards is still pickable for its first card.
     private var knownProjects: [URL] {
-        var roots = board.projectRoots
+        var roots = board.projectRoots(includingArchived: showArchive)
         if let activeProjectRoot, !roots.contains(where: { $0.path == activeProjectRoot.path }) {
             roots.insert(activeProjectRoot, at: 0)
         }
@@ -157,6 +197,17 @@ struct KanbanBoardView: View {
 
     private var canCreateCard: Bool {
         (selectedProject ?? activeProjectRoot) != nil
+    }
+
+    /// Done cards "archive all" would take — the current project filter's.
+    private var doneCardsInFilter: [KanbanCard] {
+        board.cards(in: .done, project: selectedProject)
+    }
+
+    /// Newest first: the card you just archived is the one you're most
+    /// likely looking for.
+    private var archivedCardsInFilter: [KanbanCard] {
+        board.archivedCards(project: selectedProject).reversed()
     }
 
     // MARK: Columns
@@ -224,9 +275,15 @@ struct KanbanBoardView: View {
                     .font(Theme.mono(10))
                     .foregroundStyle(Theme.chromeMuted.opacity(0.6))
                 Spacer()
+                if column == .done, !cards.isEmpty {
+                    BracketButton("archive all") { archiveAllDone() }
+                        .help(String(localized: "Archive every Done card of the current project filter", bundle: bundle))
+                }
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 12)
+            // Fixed height so Done's "archive all" button (taller than the
+            // 10pt heading) doesn't push that column's cards below the rest.
+            .frame(height: 40)
             ScrollView(.vertical) {
                 LazyVStack(alignment: .leading, spacing: 8) {
                     ForEach(cards) { card in
@@ -240,9 +297,13 @@ struct KanbanBoardView: View {
                             onRelaunch: { relaunch(card) },
                             onReopen: { reopen(card) },
                             onMove: { target in move(card.id, to: target) },
-                            onDelete: { board.remove(id: card.id) }
+                            onDelete: { board.remove(id: card.id) },
+                            onArchive: column == .done ? { archive(card.id) } : nil
                         )
                         .draggable(card.id.uuidString)
+                    }
+                    if column == .done, showArchive {
+                        archiveSection
                     }
                 }
                 .padding(.horizontal, 12)
@@ -262,7 +323,86 @@ struct KanbanBoardView: View {
         }
     }
 
+    /// Read-only tail of the Done column while "show archive" is on. The
+    /// cards aren't draggable and open in a read-only editor; the only way
+    /// out is "restore", which puts the card back above this section.
+    private var archiveSection: some View {
+        let archivedCards = archivedCardsInFilter
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text(String(localized: "ARCHIVE", bundle: bundle))
+                    .font(Theme.mono(10, weight: .medium))
+                    .tracking(1.2)
+                    .foregroundStyle(Theme.chromeMuted.opacity(0.9))
+                Text("\(archivedCards.count)")
+                    .font(Theme.mono(10))
+                    .foregroundStyle(Theme.chromeMuted.opacity(0.6))
+                Spacer()
+            }
+            .padding(.top, 10)
+            Rectangle().fill(Theme.chromeHairline).frame(height: 1)
+            if archivedCards.isEmpty {
+                Text(String(localized: "nothing archived for this filter", bundle: bundle))
+                    .font(Theme.mono(10.5))
+                    .foregroundStyle(Theme.chromeMuted.opacity(0.7))
+                    .padding(.vertical, 4)
+            }
+            ForEach(archivedCards) { card in
+                KanbanCardView(
+                    card: card,
+                    live: nil,
+                    isLaunching: false,
+                    onOpen: { viewingArchivedCard = card },
+                    onWatch: {},
+                    onReveal: {},
+                    onRelaunch: {},
+                    onReopen: {},
+                    onMove: { _ in },
+                    onDelete: {},
+                    isArchived: true,
+                    onUnarchive: { unarchive(card.id) }
+                )
+            }
+        }
+    }
+
     // MARK: Actions
+
+    private func archive(_ id: UUID) {
+        guard let card = board.card(id: id), board.archive(id: id) else { return }
+        show(Notice(
+            text: String.localizedStringWithFormat(String(localized: "Archived “%@”", bundle: bundle), card.title),
+            tone: .info
+        ))
+    }
+
+    private func unarchive(_ id: UUID) {
+        guard let card = board.archivedCard(id: id), board.unarchive(id: id) else { return }
+        show(Notice(
+            text: String.localizedStringWithFormat(String(localized: "Restored “%@” to Done", bundle: bundle), card.title),
+            tone: .info
+        ))
+    }
+
+    /// One card goes straight away; two or more ask first — "archive all"
+    /// sits next to a column header and a stray click must not empty it.
+    private func archiveAllDone() {
+        let count = doneCardsInFilter.count
+        guard count > 0 else { return }
+        if count >= 2 {
+            confirmArchiveAll = true
+        } else {
+            performArchiveAll()
+        }
+    }
+
+    private func performArchiveAll() {
+        let count = board.archiveAllDone(project: selectedProject)
+        show(Notice(
+            text: String.localizedStringWithFormat(String(localized: "Archived %d cards", bundle: bundle), count),
+            tone: .info
+        ))
+    }
 
     private func move(_ id: UUID, to column: KanbanColumn) {
         if let card = board.card(id: id), card.column == .inProgress {

@@ -6,18 +6,28 @@ import XCTest
 @MainActor
 final class InMemoryKanbanPersistence: KanbanPersistence {
     var saved: [KanbanCard]?
+    var savedArchive: [KanbanCard]?
     private(set) var saveCount = 0
+    private(set) var archiveSaveCount = 0
     private let initial: [KanbanCard]?
+    private let initialArchive: [KanbanCard]?
 
-    init(initial: [KanbanCard]? = nil) {
+    init(initial: [KanbanCard]? = nil, initialArchive: [KanbanCard]? = nil) {
         self.initial = initial
+        self.initialArchive = initialArchive
     }
 
     func load() -> [KanbanCard]? { initial }
+    func loadArchive() -> [KanbanCard]? { initialArchive }
 
     func save(_ cards: [KanbanCard]) {
         saved = cards
         saveCount += 1
+    }
+
+    func saveArchive(_ cards: [KanbanCard]) {
+        savedArchive = cards
+        archiveSaveCount += 1
     }
 }
 
@@ -36,9 +46,18 @@ final class KanbanStoreTests: XCTestCase {
         )
     }
 
-    private func makeStore(initial: [KanbanCard]? = nil) -> (KanbanStore, InMemoryKanbanPersistence) {
-        let persistence = InMemoryKanbanPersistence(initial: initial)
+    private func makeStore(initial: [KanbanCard]? = nil, initialArchive: [KanbanCard]? = nil) -> (KanbanStore, InMemoryKanbanPersistence) {
+        let persistence = InMemoryKanbanPersistence(initial: initial, initialArchive: initialArchive)
         return (KanbanStore(persistence: persistence), persistence)
+    }
+
+    /// A card already in Done (walked there through `move`, so the rules
+    /// and history are the real ones).
+    private func doneCard(project: URL? = nil, title: String = "Feature", in store: KanbanStore) -> KanbanCard {
+        let card = readyCard(project: project, title: title)
+        store.add(card)
+        store.move(card.id, to: .done)
+        return store.card(id: card.id)!
     }
 
     // MARK: - CRUD
@@ -203,5 +222,185 @@ final class KanbanStoreTests: XCTestCase {
         try "not json".write(to: url, atomically: true, encoding: .utf8)
         XCTAssertNil(FileKanbanPersistence(fileURL: url).load())
         try? FileManager.default.removeItem(at: url)
+    }
+
+    // MARK: - Archive
+
+    func testArchiveMovesDoneCardOutOfCardsIntoArchivedWithHistory() {
+        let (store, _) = makeStore()
+        let card = doneCard(in: store)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+        XCTAssertTrue(store.archive(id: card.id, now: now))
+        XCTAssertNil(store.card(id: card.id), "archived cards leave `cards`")
+        XCTAssertTrue(store.cards(in: .done).isEmpty)
+        XCTAssertTrue(store.projectRoots.isEmpty, "the filter forgets a repo whose only card is archived")
+        XCTAssertEqual(store.projectRoots(includingArchived: true).map(\.path), [projectA.path])
+
+        let archived = store.archivedCard(id: card.id)
+        XCTAssertNotNil(archived)
+        XCTAssertEqual(archived?.column, .done)
+        XCTAssertEqual(archived?.events.last?.message, "archived")
+        XCTAssertEqual(archived?.events.last?.timestamp, now)
+        XCTAssertEqual(archived?.events.map(\.message).dropLast(), card.events.map(\.message)[...], "history travels with the card")
+        XCTAssertEqual(store.archivedCards().map(\.id), [card.id])
+    }
+
+    func testArchiveRefusesCardsOutsideDone() {
+        let (store, _) = makeStore()
+        let card = readyCard()
+        store.add(card)
+        XCTAssertFalse(store.archive(id: card.id))
+        store.move(card.id, to: .inReview)
+        XCTAssertFalse(store.archive(id: card.id))
+        XCTAssertEqual(store.cards.count, 1)
+        XCTAssertTrue(store.archived.isEmpty)
+        XCTAssertFalse(store.archive(id: UUID()), "unknown id")
+    }
+
+    func testArchiveKeepsWorktreeAndBranch() {
+        let (store, _) = makeStore()
+        let card = readyCard()
+        store.add(card)
+        store.move(card.id, to: .inProgress)
+        store.markLaunched(id: card.id, worktreePath: URL(fileURLWithPath: "/tmp/kanban-a-feature"), workspaceId: UUID(), sessionId: UUID(), branch: "feature/x")
+        store.move(card.id, to: .done)
+        XCTAssertTrue(store.archive(id: card.id))
+        let archived = store.archivedCard(id: card.id)
+        XCTAssertEqual(archived?.worktreePath?.path, "/tmp/kanban-a-feature")
+        XCTAssertEqual(archived?.branchName, "feature/x")
+    }
+
+    func testUnarchivePutsCardBackInDone() {
+        let (store, _) = makeStore()
+        let card = doneCard(in: store)
+        store.archive(id: card.id)
+
+        XCTAssertTrue(store.unarchive(id: card.id))
+        XCTAssertNil(store.archivedCard(id: card.id))
+        let restored = store.card(id: card.id)
+        XCTAssertEqual(restored?.column, .done)
+        XCTAssertEqual(restored?.events.suffix(2).map(\.message), ["archived", "unarchived"])
+        XCTAssertEqual(store.cards(in: .done).map(\.id), [card.id])
+        XCTAssertFalse(store.unarchive(id: card.id), "already live")
+    }
+
+    func testUnarchiveForcesDoneEvenIfArchiveSaysOtherwise() {
+        var stale = readyCard()
+        stale.column = .inProgress   // a hand-edited archive.json
+        let (store, _) = makeStore(initialArchive: [stale])
+        XCTAssertTrue(store.unarchive(id: stale.id))
+        XCTAssertEqual(store.card(id: stale.id)?.column, .done)
+    }
+
+    func testArchiveAllDoneHonoursProjectFilter() {
+        let (store, _) = makeStore()
+        let a1 = doneCard(project: projectA, title: "A1", in: store)
+        let a2 = doneCard(project: projectA, title: "A2", in: store)
+        let b = doneCard(project: projectB, title: "B", in: store)
+        let ready = readyCard(project: projectA, title: "not done")
+        store.add(ready)
+
+        XCTAssertEqual(store.archiveAllDone(project: projectA), 2)
+        XCTAssertEqual(Set(store.archived.map(\.id)), [a1.id, a2.id])
+        XCTAssertEqual(store.cards(in: .done).map(\.id), [b.id], "the other project's Done card stays")
+        XCTAssertNotNil(store.card(id: ready.id), "only Done cards move")
+
+        XCTAssertEqual(store.archiveAllDone(project: nil), 1, "nil = every project")
+        XCTAssertTrue(store.cards(in: .done).isEmpty)
+        XCTAssertEqual(store.archiveAllDone(project: nil), 0)
+    }
+
+    func testAutoArchiveMovesStaleDoneCardsOnly() {
+        let (store, _) = makeStore()
+        let day: TimeInterval = 86_400
+        let now = Date()
+        let old = doneCard(title: "old", in: store)
+        let fresh = doneCard(title: "fresh", in: store)
+        let oldReady = readyCard(title: "old but not done")
+        store.add(oldReady)
+        // Backdate the last history entry — that's what the sweep reads.
+        var cards = store.cards
+        for idx in cards.indices where cards[idx].id != fresh.id {
+            cards[idx].events[cards[idx].events.count - 1].timestamp = now.addingTimeInterval(-40 * day)
+        }
+        let (aged, _) = makeStore(initial: cards)
+
+        XCTAssertEqual(aged.autoArchive(doneOlderThan: 30, now: now), 1)
+        XCTAssertNotNil(aged.archivedCard(id: old.id))
+        XCTAssertNotNil(aged.card(id: fresh.id), "a Done card younger than N days stays")
+        XCTAssertNotNil(aged.card(id: oldReady.id), "an old card outside Done stays")
+        XCTAssertEqual(aged.autoArchive(doneOlderThan: 0, now: now), 0, "0 days = off, never 'everything'")
+    }
+
+    func testArchivePersistsToArchiveFileAndBoardFile() {
+        let (store, persistence) = makeStore()
+        let card = doneCard(in: store)
+        store.archive(id: card.id)
+        store.flush()
+        XCTAssertEqual(persistence.saved?.count, 0, "board.json no longer holds the card")
+        XCTAssertEqual(persistence.savedArchive?.map(\.id), [card.id])
+        XCTAssertEqual(persistence.archiveSaveCount, 1)
+
+        // An unrelated edit must not rewrite the archive.
+        let other = readyCard(title: "other")
+        store.add(other)
+        store.flush()
+        XCTAssertEqual(persistence.archiveSaveCount, 1)
+
+        store.unarchive(id: card.id)
+        store.flush()
+        XCTAssertEqual(persistence.savedArchive?.count, 0)
+        XCTAssertEqual(persistence.archiveSaveCount, 2)
+        XCTAssertEqual(Set(persistence.saved?.map(\.id) ?? []), [card.id, other.id])
+    }
+
+    func testArchiveSaveIsDebouncedWithBoardSave() async throws {
+        let (store, persistence) = makeStore()
+        let card = doneCard(in: store)
+        store.archive(id: card.id)
+        XCTAssertNil(persistence.savedArchive)
+        try await Task.sleep(nanoseconds: 1_300_000_000)
+        XCTAssertEqual(persistence.savedArchive?.map(\.id), [card.id])
+    }
+
+    func testMissingArchiveLoadsAsEmptyAndArchiveRoundTripsOnDisk() {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kooky-board-test-\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = FileKanbanPersistence(fileURL: dir.appendingPathComponent("board.json"))
+        XCTAssertEqual(file.archiveFileURL.lastPathComponent, "archive.json")
+        XCTAssertEqual(file.archiveFileURL.deletingLastPathComponent().path, dir.path, "beside board.json")
+        XCTAssertNil(file.loadArchive(), "no archive.json yet")
+
+        let store = KanbanStore(persistence: file)
+        XCTAssertTrue(store.archived.isEmpty, "missing archive.json → empty archive, not a failure")
+        let card = doneCard(in: store)
+        store.archive(id: card.id)
+        store.flush()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.archiveFileURL.path))
+        let raw = try? JSONSerialization.jsonObject(with: Data(contentsOf: file.archiveFileURL)) as? [String: Any]
+        XCTAssertEqual(raw?["version"] as? Int, 1, "same versioned envelope as board.json")
+        XCTAssertEqual((raw?["cards"] as? [Any])?.count, 1)
+
+        let reloaded = KanbanStore(persistence: file)
+        XCTAssertTrue(reloaded.cards.isEmpty)
+        XCTAssertEqual(reloaded.archivedCard(id: card.id)?.title, card.title)
+        XCTAssertEqual(reloaded.archivedCard(id: card.id)?.events.last?.message, "archived")
+    }
+
+    func testCorruptArchiveDoesNotTakeTheBoardDown() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kooky-board-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = FileKanbanPersistence(fileURL: dir.appendingPathComponent("board.json"))
+        file.save([readyCard()])
+        try "not json".write(to: file.archiveFileURL, atomically: true, encoding: .utf8)
+        let store = KanbanStore(persistence: file)
+        XCTAssertEqual(store.cards.count, 1)
+        XCTAssertTrue(store.archived.isEmpty)
     }
 }
