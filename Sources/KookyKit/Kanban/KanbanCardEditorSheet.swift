@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Brutalist card editor — same visual language as `CreateWorktreeSheet`.
 /// Edits a local copy; `save` hands the copy back and the store decides
@@ -29,6 +30,11 @@ struct KanbanCardEditorSheet: View {
     @State private var isDrafting = false
     @State private var draftError: String?
     @State private var draftProposal: KanbanCardDraft?
+    /// Attachments as opened — cancelling deletes managed files (pasted
+    /// screenshots) added since, so a discarded edit leaves no husks.
+    private let originalAttachments: [String]
+    @State private var isDropTargeted = false
+    @State private var attachmentError: String?
 
     private var bundle: Bundle { .kookyResources }
 
@@ -44,6 +50,7 @@ struct KanbanCardEditorSheet: View {
         self.delete = delete
         self.dismiss = dismiss
         _draft = State(initialValue: card)
+        originalAttachments = card.attachments
         _criteriaText = State(initialValue: card.acceptanceCriteria.joined(separator: "\n"))
         _modelText = State(initialValue: card.model ?? "")
         _skillText = State(initialValue: card.skill ?? "")
@@ -163,7 +170,7 @@ struct KanbanCardEditorSheet: View {
                         .foregroundStyle(Theme.activityFailure)
                 }
                 Spacer()
-                BracketButton("cancel") { dismiss() }
+                BracketButton("cancel") { cancel() }
                 BracketButton(isNew ? "create" : "save") { submit() }
                     .disabled(!canSubmit)
                     .opacity(canSubmit ? 1 : 0.4)
@@ -511,19 +518,43 @@ struct KanbanCardEditorSheet: View {
                     .tracking(1.2)
                     .foregroundStyle(Theme.chromeMuted.opacity(0.85))
                 Spacer()
+                BracketButton("paste") { pasteAttachments() }
+                    .help(String(localized: "Attach the clipboard — a screenshot (⌃⇧⌘4) is saved as a PNG for this card, copied files are referenced", bundle: bundle))
                 BracketButton("add files…") { chooseAttachments() }
                     .help(String(localized: "Attach specs, screenshots or mockups — the drafting agent reads them and the launch prompt lists them", bundle: bundle))
             }
-            if draft.attachments.isEmpty {
-                Text(String(localized: "no attachments", bundle: bundle))
-                    .font(Theme.mono(10.5))
-                    .foregroundStyle(Theme.chromeMuted.opacity(0.6))
-            } else {
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(draft.attachments, id: \.self) { path in
-                        attachmentRow(path)
+            Group {
+                if draft.attachments.isEmpty {
+                    Text(String(localized: isDropTargeted ? "drop to attach" : "no attachments — drop files or images here", bundle: bundle))
+                        .font(Theme.mono(10.5))
+                        .foregroundStyle(Theme.chromeMuted.opacity(0.6))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 6)
+                } else {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(draft.attachments, id: \.self) { path in
+                            attachmentRow(path)
+                        }
                     }
                 }
+            }
+            .padding(4)
+            .overlay(
+                Rectangle()
+                    .stroke(Theme.activityRunning.opacity(isDropTargeted ? 0.8 : 0), lineWidth: 1)
+            )
+            .background(Theme.activityRunning.opacity(isDropTargeted ? 0.06 : 0))
+            .onDrop(of: [.fileURL, .image], isTargeted: $isDropTargeted) { providers in
+                acceptDrop(providers)
+            }
+            .onPasteCommand(of: [.fileURL, .image, .png, .tiff]) { _ in
+                pasteAttachments()
+            }
+            if let attachmentError {
+                Text(attachmentError)
+                    .font(Theme.mono(10.5))
+                    .foregroundStyle(Theme.activityFailure.opacity(0.85))
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -531,8 +562,9 @@ struct KanbanCardEditorSheet: View {
 
     private func attachmentRow(_ path: String) -> some View {
         let missing = !KanbanCard.attachmentExists(path)
+        let managed = KanbanAttachmentStore.isManaged(path)
         return HStack(spacing: 8) {
-            Image(systemName: missing ? "exclamationmark.triangle" : "paperclip")
+            Image(systemName: missing ? "exclamationmark.triangle" : (managed ? "camera" : "paperclip"))
                 .font(.system(size: 10))
                 .foregroundStyle(missing ? Theme.activityFailure : Theme.chromeMuted)
             Text(KanbanCard.attachmentFileName(path))
@@ -557,7 +589,7 @@ struct KanbanCardEditorSheet: View {
                     .foregroundStyle(Theme.chromeMuted)
             }
             .buttonStyle(.plain)
-            .help(String(localized: "Remove attachment", bundle: bundle))
+            .help(String(localized: managed ? "Remove attachment — deletes the screenshot Kooky saved" : "Remove attachment", bundle: bundle))
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
@@ -593,6 +625,60 @@ struct KanbanCardEditorSheet: View {
         } else if panel.runModal() == .OK {
             add()
         }
+    }
+
+    /// Clipboard → attachments. Files are referenced, image bytes become a
+    /// managed PNG under the card's folder (the card id exists before the
+    /// first save, so new cards work too).
+    private func pasteAttachments() {
+        attachmentError = nil
+        let sources = KanbanAttachmentImport.sources(from: .general)
+        guard !sources.isEmpty else {
+            attachmentError = String(localized: "the clipboard holds neither files nor an image", bundle: bundle)
+            return
+        }
+        addAttachments(sources)
+    }
+
+    /// Finder files and image drags (browser, Preview). Providers deliver
+    /// asynchronously off the main thread; results hop back before touching
+    /// state. File URLs are preferred per provider, image data is the
+    /// fallback — the same precedence as the clipboard.
+    private func acceptDrop(_ providers: [NSItemProvider]) -> Bool {
+        attachmentError = nil
+        let relevant = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) || $0.hasItemConformingToTypeIdentifier(UTType.image.identifier) }
+        guard !relevant.isEmpty else { return false }
+        for provider in relevant {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { item, _ in
+                    let url: URL? = (item as? URL) ?? (item as? Data).flatMap { URL(dataRepresentation: $0, relativeTo: nil) }
+                    guard let url else { return }
+                    Task { @MainActor in addAttachments(KanbanAttachmentImport.sources(fileURLs: [url], imageData: nil)) }
+                }
+            } else {
+                let type = provider.registeredTypeIdentifiers.first { UTType($0)?.conforms(to: .image) == true } ?? UTType.image.identifier
+                provider.loadDataRepresentation(forTypeIdentifier: type) { data, _ in
+                    guard let data else { return }
+                    Task { @MainActor in addAttachments(KanbanAttachmentImport.sources(fileURLs: [], imageData: data)) }
+                }
+            }
+        }
+        return true
+    }
+
+    private func addAttachments(_ sources: [KanbanAttachmentImport.Source]) {
+        let before = draft.attachments.count
+        KanbanAttachmentImport.apply(sources, to: &draft.attachments, cardId: draft.id)
+        if draft.attachments.count == before, sources.contains(where: { if case .image = $0 { return true } else { return false } }) {
+            attachmentError = String(localized: "couldn't save the image", bundle: bundle)
+        }
+    }
+
+    /// Cancel = the card as it was: screenshots pasted during this edit
+    /// have no owner any more and are deleted with the draft.
+    private func cancel() {
+        KanbanAttachmentStore.removeOrphans(cardId: draft.id, keeping: originalAttachments)
+        dismiss()
     }
 
     // MARK: Helpers

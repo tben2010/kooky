@@ -190,6 +190,7 @@ final class KanbanStore {
         var card = card
         card.record("created")
         cards.append(card)
+        KanbanAttachmentStore.removeOrphans(cardId: card.id, keeping: card.attachments)
         scheduleSave()
     }
 
@@ -210,11 +211,15 @@ final class KanbanStore {
         card.projectRoot = edited.projectRoot.standardizedFileURL
         card.touch()
         cards[idx] = card
+        // Pasted screenshots the editor dropped again are Kooky's files —
+        // delete them with the reference.
+        KanbanAttachmentStore.removeOrphans(cardId: card.id, keeping: card.attachments)
         scheduleSave()
     }
 
     func remove(id: UUID) {
         cards.removeAll { $0.id == id }
+        KanbanAttachmentStore.removeAll(cardId: id)
         scheduleSave()
     }
 
