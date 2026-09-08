@@ -205,6 +205,7 @@ final class KanbanStore {
         card.agentId = edited.agentId
         card.model = edited.model
         card.skill = edited.skill
+        card.attachments = edited.attachments
         card.branchName = edited.branchName
         card.projectRoot = edited.projectRoot.standardizedFileURL
         card.touch()

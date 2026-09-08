@@ -84,6 +84,16 @@ struct KanbanCardView: View {
                         .bracketBorder()
                 }
                 Spacer(minLength: 0)
+                if !card.attachments.isEmpty {
+                    HStack(spacing: 2) {
+                        Image(systemName: "paperclip")
+                            .font(.system(size: 9))
+                        Text("\(card.attachments.count)")
+                    }
+                    .font(Theme.mono(9.5))
+                    .foregroundStyle(Theme.chromeMuted.opacity(0.7))
+                    .help(card.attachments.map(KanbanCard.attachmentFileName).joined(separator: "\n"))
+                }
                 Text("\(card.effectiveCriteria.count) AC")
                     .font(Theme.mono(9.5))
                     .foregroundStyle(Theme.chromeMuted.opacity(0.7))

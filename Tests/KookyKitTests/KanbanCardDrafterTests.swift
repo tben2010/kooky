@@ -44,6 +44,45 @@ final class KanbanCardDrafterTests: XCTestCase {
         XCTAssertFalse(bare.contains("Existing acceptance criteria"))
     }
 
+    func testPromptListsAttachmentsWithReadInstructionAndMissingFlag() {
+        let previous = KanbanCard.attachmentExists
+        defer { KanbanCard.attachmentExists = previous }
+        KanbanCard.attachmentExists = { $0.hasSuffix("spec.md") }
+
+        let prompt = KanbanCardDrafter.prompt(
+            title: "Ticker", requirement: "", criteria: [],
+            attachments: ["/docs/spec.md", "/docs/mockup.png"]
+        )
+        XCTAssertTrue(prompt.contains("Attached files"), prompt)
+        XCTAssertTrue(prompt.contains("Read every one of them"), prompt)
+        XCTAssertTrue(prompt.contains("- `/docs/spec.md`\n"), prompt)
+        XCTAssertTrue(prompt.contains("- `/docs/mockup.png` (\(KanbanCard.missingAttachmentNote))"), prompt)
+        let sectionIndex = prompt.range(of: "Attached files")!.lowerBound
+        let writeIndex = prompt.range(of: "Write, in the same language")!.lowerBound
+        XCTAssertLessThan(sectionIndex, writeIndex, "attachments precede the output instructions")
+
+        XCTAssertFalse(KanbanCardDrafter.prompt(title: "X", requirement: "", criteria: []).contains("Attached files"))
+    }
+
+    func testCommandGrantsAttachmentDirectories() throws {
+        let command = try XCTUnwrap(KanbanCardDrafter.command(
+            template: .claudeCode, model: nil, prompt: "p",
+            extraDirectories: ["/docs/a b", "/spec"]
+        ))
+        XCTAssertTrue(command.contains("--add-dir '/docs/a b' --add-dir '/spec'"), command)
+        XCTAssertTrue(command.hasPrefix("claude -p 'p' --permission-mode plan"), command)
+    }
+
+    func testAttachmentDirectoriesDedupeAndSkipMissing() {
+        let previous = KanbanCard.attachmentExists
+        defer { KanbanCard.attachmentExists = previous }
+        KanbanCard.attachmentExists = { !$0.contains("gone") }
+        let dirs = KanbanCardDrafter.attachmentDirectories([
+            "/docs/spec.md", "/docs/mockup.png", "/other/gone.txt", "/spec/x.md",
+        ])
+        XCTAssertEqual(dirs, ["/docs", "/spec"])
+    }
+
     // MARK: - Parsing
 
     func testParseAcceptsPlainFencedAndPrefacedJSON() throws {
@@ -85,6 +124,32 @@ final class KanbanCardDrafterTests: XCTestCase {
         XCTAssertEqual(call.cwd, root)
         XCTAssertTrue(call.command.contains("--permission-mode plan"))
         XCTAssertTrue(call.command.contains("Ticker"))
+    }
+
+    func testDraftPassesAttachmentsIntoPromptAndAddDir() async throws {
+        let previousRunner = KanbanCardDrafter.runner
+        let previousExists = KanbanCard.attachmentExists
+        defer {
+            KanbanCardDrafter.runner = previousRunner
+            KanbanCard.attachmentExists = previousExists
+        }
+        KanbanCard.attachmentExists = { $0.hasSuffix("spec.md") }
+        nonisolated(unsafe) var seen: String?
+        KanbanCardDrafter.runner = { command, _ in
+            seen = command
+            return .success(#"{"requirement": "R", "acceptanceCriteria": ["a"]}"#)
+        }
+        _ = await KanbanCardDrafter.draft(
+            title: "Ticker", requirement: "", criteria: [],
+            attachments: ["/docs/spec.md", "/docs/gone.png"],
+            projectRoot: root, template: .claudeCode, model: nil
+        )
+        let command = try XCTUnwrap(seen)
+        XCTAssertTrue(command.contains("--add-dir '/docs'"), command)
+        XCTAssertEqual(command.components(separatedBy: "--add-dir").count, 2, "one grant per folder: \(command)")
+        XCTAssertTrue(command.contains("/docs/spec.md"), command)
+        XCTAssertTrue(command.contains("/docs/gone.png"), "missing files are still named, just flagged: \(command)")
+        XCTAssertTrue(command.contains("MISSING"), command)
     }
 
     func testDraftSurfacesRunnerFailureAndUnsupportedAgent() async {

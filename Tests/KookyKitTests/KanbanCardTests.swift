@@ -110,6 +110,62 @@ final class KanbanCardTests: XCTestCase {
         XCTAssertTrue(card.promptText(workingDirectory: root, branch: "b", isWorktree: true).hasPrefix("# Feature: T"))
     }
 
+    // MARK: - Attachments
+
+    /// A real temp file + a path that never existed: the prompt must list
+    /// both, and only flag the second.
+    func testPromptTextListsAttachmentsAndFlagsMissingOnes() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("kanban-att-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let spec = dir.appendingPathComponent("spec.md")
+        try "ticker".write(to: spec, atomically: true, encoding: .utf8)
+        let gone = dir.appendingPathComponent("gone.png").path
+
+        var card = KanbanCard(title: "T", requirement: "R", acceptanceCriteria: ["A"], projectRoot: root, agentId: "claude-code")
+        let without = card.promptText(workingDirectory: root, branch: "main", isWorktree: false)
+        XCTAssertFalse(without.contains("## Attachments"), "no section without attachments")
+
+        card.attachments = [spec.path, gone]
+        let prompt = card.promptText(workingDirectory: root, branch: "main", isWorktree: false)
+        let lines = prompt.components(separatedBy: "\n")
+        let header = try XCTUnwrap(lines.firstIndex(of: "## Attachments"))
+        let agreement = try XCTUnwrap(lines.firstIndex(of: "## Working agreement"))
+        XCTAssertLessThan(header, agreement, "attachments come before the working agreement")
+        XCTAssertTrue(lines.contains("- `\(spec.path)`"), prompt)
+        XCTAssertTrue(lines.contains("- `\(gone)` (\(KanbanCard.missingAttachmentNote))"), prompt)
+    }
+
+    func testAttachmentPathStandardizesAndNamesFile() {
+        let path = KanbanCard.attachmentPath(for: URL(fileURLWithPath: "/tmp/../tmp/x/./spec.md"))
+        XCTAssertEqual(path, "/tmp/x/spec.md")
+        XCTAssertEqual(KanbanCard.attachmentFileName(path), "spec.md")
+    }
+
+    // MARK: - Codable
+
+    func testDecodesBoardWithoutAttachmentsField() throws {
+        var card = KanbanCard(title: "Old", requirement: "R", acceptanceCriteria: ["A"], projectRoot: root, agentId: "claude-code")
+        card.attachments = ["/tmp/spec.md"]
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        // Round trip keeps the field.
+        let data = try encoder.encode(card)
+        XCTAssertEqual(try decoder.decode(KanbanCard.self, from: data).attachments, ["/tmp/spec.md"])
+
+        // A pre-field board.json (key absent) still loads — as no attachments.
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        object.removeValue(forKey: "attachments")
+        let legacy = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try decoder.decode(KanbanCard.self, from: legacy)
+        XCTAssertEqual(decoded.attachments, [])
+        XCTAssertEqual(decoded.title, "Old")
+        XCTAssertEqual(decoded.id, card.id)
+    }
+
     // MARK: - Events
 
     func testRecordCapsEventLog() {

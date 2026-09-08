@@ -262,6 +262,7 @@ struct KanbanCardEditorSheet: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            attachmentsSection
             if let draftProposal {
                 proposalView(draftProposal)
             }
@@ -437,6 +438,7 @@ struct KanbanCardEditorSheet: View {
         let title = draft.title
         let requirement = draft.requirement
         let criteria = criteriaText.split(whereSeparator: \.isNewline).map(String.init)
+        let attachments = draft.attachments
         let root = draft.projectRoot
         let template = selectedTemplate
         let model = modelText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -445,6 +447,7 @@ struct KanbanCardEditorSheet: View {
                 title: title,
                 requirement: requirement,
                 criteria: criteria,
+                attachments: attachments,
                 projectRoot: root,
                 template: template,
                 model: model.isEmpty ? nil : model
@@ -494,6 +497,102 @@ struct KanbanCardEditorSheet: View {
         .background(Theme.activityRunning.opacity(0.06))
         .overlay(Rectangle().stroke(Theme.activityRunning.opacity(0.5), lineWidth: 1))
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: Attachments
+
+    /// Reference files under the requirement. Edits live in `draft` like
+    /// every other field — nothing reaches the store before save.
+    private var attachmentsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .center) {
+                Text(LocalizedStringKey("attachments"), bundle: bundle)
+                    .font(Theme.mono(10, weight: .medium))
+                    .tracking(1.2)
+                    .foregroundStyle(Theme.chromeMuted.opacity(0.85))
+                Spacer()
+                BracketButton("add files…") { chooseAttachments() }
+                    .help(String(localized: "Attach specs, screenshots or mockups — the drafting agent reads them and the launch prompt lists them", bundle: bundle))
+            }
+            if draft.attachments.isEmpty {
+                Text(String(localized: "no attachments", bundle: bundle))
+                    .font(Theme.mono(10.5))
+                    .foregroundStyle(Theme.chromeMuted.opacity(0.6))
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(draft.attachments, id: \.self) { path in
+                        attachmentRow(path)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func attachmentRow(_ path: String) -> some View {
+        let missing = !KanbanCard.attachmentExists(path)
+        return HStack(spacing: 8) {
+            Image(systemName: missing ? "exclamationmark.triangle" : "paperclip")
+                .font(.system(size: 10))
+                .foregroundStyle(missing ? Theme.activityFailure : Theme.chromeMuted)
+            Text(KanbanCard.attachmentFileName(path))
+                .font(Theme.mono(11.5))
+                .foregroundStyle(missing ? Theme.activityFailure : Theme.chromeForeground)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if missing {
+                Text(String(localized: "missing", bundle: bundle))
+                    .font(Theme.mono(9.5))
+                    .foregroundStyle(Theme.activityFailure.opacity(0.9))
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .bracketBorder()
+            }
+            Spacer(minLength: 0)
+            Button {
+                draft.attachments.removeAll { $0 == path }
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(Theme.chromeMuted)
+            }
+            .buttonStyle(.plain)
+            .help(String(localized: "Remove attachment", bundle: bundle))
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .bracketBorder()
+        .help(missing
+              ? String.localizedStringWithFormat(String(localized: "%@ — file not found", bundle: bundle), path)
+              : path)
+    }
+
+    /// Multi-select file picker, sheet-modal on the editor's window so it
+    /// can't land behind the sheet. Picks are appended (deduplicated by
+    /// standardized path) to the draft only.
+    private func chooseAttachments() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.message = String(localized: "Choose files to attach to this card.", bundle: bundle)
+        panel.directoryURL = draft.projectRoot
+        let add: () -> Void = {
+            for url in panel.urls {
+                let path = KanbanCard.attachmentPath(for: url)
+                if !draft.attachments.contains(path) {
+                    draft.attachments.append(path)
+                }
+            }
+        }
+        if let window = NSApp.keyWindow {
+            panel.beginSheetModal(for: window) { response in
+                guard response == .OK else { return }
+                add()
+            }
+        } else if panel.runModal() == .OK {
+            add()
+        }
     }
 
     // MARK: Helpers

@@ -43,20 +43,40 @@ enum KanbanCardDrafter {
     }
 
     /// The full shell command line for one draft run, or nil for agents
-    /// without a known headless mode.
-    static func command(template: AgentTemplate?, model: String?, prompt: String) -> String? {
+    /// without a known headless mode. `extraDirectories` become `--add-dir`
+    /// options: a headless run has nobody to approve reading a file outside
+    /// the project root, so attachment folders must be granted up front.
+    static func command(template: AgentTemplate?, model: String?, prompt: String, extraDirectories: [String] = []) -> String? {
         guard supports(template) else { return nil }
         var parts = ["claude", "-p", KookyShellIntegration.quote(prompt), "--permission-mode", "plan"]
+        for directory in extraDirectories {
+            parts.append("--add-dir")
+            parts.append(KookyShellIntegration.quote(directory))
+        }
         if let modelOptions = KanbanLaunchCoordinator.modelOptions(template: template, model: model) {
             parts.append(modelOptions)
         }
         return parts.joined(separator: " ")
     }
 
+    /// Parent folders of the attachments that still exist, deduplicated in
+    /// first-seen order — what `command` grants via `--add-dir`. Missing
+    /// files grant nothing (their folder may be gone too).
+    static func attachmentDirectories(_ attachments: [String]) -> [String] {
+        var seen = Set<String>()
+        var directories: [String] = []
+        for path in attachments where KanbanCard.attachmentExists(path) {
+            let directory = (path as NSString).deletingLastPathComponent
+            guard !directory.isEmpty, seen.insert(directory).inserted else { continue }
+            directories.append(directory)
+        }
+        return directories
+    }
+
     /// The instruction the agent gets. Language follows the card (the model
     /// mirrors the title's language); the JSON contract is spelled out hard
     /// because the whole answer must parse.
-    static func prompt(title: String, requirement: String, criteria: [String]) -> String {
+    static func prompt(title: String, requirement: String, criteria: [String], attachments: [String] = []) -> String {
         var lines: [String] = []
         lines.append("You are drafting a Kanban card for a feature in the repository at your current working directory.")
         lines.append("Explore the code as needed to use its real names and conventions. Do not modify anything.")
@@ -71,6 +91,11 @@ enum KanbanCardDrafter {
         if !kept.isEmpty {
             lines.append("Existing acceptance criteria (keep their intent, refine the wording):")
             for criterion in kept { lines.append("- \(criterion)") }
+        }
+        if !attachments.isEmpty {
+            lines.append("")
+            lines.append("Attached files (absolute paths). Read every one of them and take their content into account when writing the requirement and the acceptance criteria — concrete demands stated in an attachment must show up there:")
+            lines.append(contentsOf: KanbanCard.attachmentLines(attachments))
         }
         lines.append("")
         lines.append("Write, in the same language as the card title:")
@@ -88,11 +113,13 @@ enum KanbanCardDrafter {
         title: String,
         requirement: String,
         criteria: [String],
+        attachments: [String] = [],
         projectRoot: URL,
         template: AgentTemplate?,
         model: String?
     ) async -> Result<KanbanCardDraft, DraftError> {
-        guard let command = command(template: template, model: model, prompt: prompt(title: title, requirement: requirement, criteria: criteria)) else {
+        let prompt = prompt(title: title, requirement: requirement, criteria: criteria, attachments: attachments)
+        guard let command = command(template: template, model: model, prompt: prompt, extraDirectories: attachmentDirectories(attachments)) else {
             return .failure(DraftError(message: "drafting needs a Claude Code based agent"))
         }
         switch await runner(command, projectRoot) {

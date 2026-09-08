@@ -67,6 +67,11 @@ struct KanbanCard: Codable, Equatable, Identifiable, Sendable {
     var model: String?
     /// Slash-command skill prefixed to the prompt (`/develop …`); nil = none.
     var skill: String?
+    /// Reference files for the feature (specs, screenshots, mockups) as
+    /// absolute paths. Handed to the drafting agent and listed in the
+    /// launch prompt; the files themselves stay where the user picked
+    /// them. Missing on pre-field board.json files → empty.
+    var attachments: [String]
     /// Branch the worktree checks out. Suggested from the title, editable.
     var branchName: String
     /// Pinned at first launch — mirrors `Workspace.worktreePath`.
@@ -95,6 +100,7 @@ struct KanbanCard: Codable, Equatable, Identifiable, Sendable {
         agentId: String,
         model: String? = nil,
         skill: String? = nil,
+        attachments: [String] = [],
         branchName: String? = nil,
         now: Date = Date()
     ) {
@@ -107,10 +113,37 @@ struct KanbanCard: Codable, Equatable, Identifiable, Sendable {
         self.agentId = agentId
         self.model = model
         self.skill = skill
+        self.attachments = attachments
         self.branchName = branchName ?? Self.suggestedBranchName(for: title)
         self.events = []
         self.createdAt = now
         self.updatedAt = now
+    }
+
+    /// Hand-written so `attachments` (added after the first boards were
+    /// written) may be absent; every other key decodes as synthesized.
+    /// `encode(to:)` and `CodingKeys` stay compiler-generated.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        title = try c.decode(String.self, forKey: .title)
+        requirement = try c.decode(String.self, forKey: .requirement)
+        acceptanceCriteria = try c.decode([String].self, forKey: .acceptanceCriteria)
+        column = try c.decode(KanbanColumn.self, forKey: .column)
+        projectRoot = try c.decode(URL.self, forKey: .projectRoot)
+        agentId = try c.decode(String.self, forKey: .agentId)
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        skill = try c.decodeIfPresent(String.self, forKey: .skill)
+        attachments = try c.decodeIfPresent([String].self, forKey: .attachments) ?? []
+        branchName = try c.decode(String.self, forKey: .branchName)
+        worktreePath = try c.decodeIfPresent(URL.self, forKey: .worktreePath)
+        launchedWorkspaceId = try c.decodeIfPresent(UUID.self, forKey: .launchedWorkspaceId)
+        launchedSessionId = try c.decodeIfPresent(UUID.self, forKey: .launchedSessionId)
+        lastLaunchedSessionId = try c.decodeIfPresent(UUID.self, forKey: .lastLaunchedSessionId)
+        conversationId = try c.decodeIfPresent(String.self, forKey: .conversationId)
+        events = try c.decode([KanbanEvent].self, forKey: .events)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        updatedAt = try c.decode(Date.self, forKey: .updatedAt)
     }
 
     // MARK: Derived
@@ -186,6 +219,37 @@ struct KanbanCard: Codable, Equatable, Identifiable, Sendable {
         return true
     }
 
+    // MARK: Attachments
+
+    /// Test seam for "does this attachment still exist" — the prompt and the
+    /// editor both mark files that went away instead of dropping them.
+    nonisolated(unsafe) static var attachmentExists: @Sendable (_ path: String) -> Bool = { path in
+        FileManager.default.fileExists(atPath: path)
+    }
+
+    /// Absolute path for a picked file — `standardizedFileURL` folds `..`
+    /// and symlinked `/tmp`-style prefixes so duplicates compare equal.
+    static func attachmentPath(for url: URL) -> String {
+        url.standardizedFileURL.path
+    }
+
+    static func attachmentFileName(_ path: String) -> String {
+        (path as NSString).lastPathComponent
+    }
+
+    /// Suffix the prompts append to an attachment whose file is gone.
+    static let missingAttachmentNote = "MISSING — the file no longer exists at this path; tell the user instead of guessing its content"
+
+    /// One Markdown bullet per attachment, absolute path in backticks,
+    /// missing files flagged in place (never silently skipped).
+    static func attachmentLines(_ paths: [String]) -> [String] {
+        paths.map { path in
+            attachmentExists(path)
+                ? "- `\(path)`"
+                : "- `\(path)` (\(missingAttachmentNote))"
+        }
+    }
+
     /// The text the agent is launched with. `workingDirectory` / `branch`
     /// are passed in (not read from self) so the prompt describes the
     /// launch that is actually happening, not a stale pin. `isWorktree`
@@ -205,6 +269,12 @@ struct KanbanCard: Codable, Equatable, Identifiable, Sendable {
         lines.append("## Acceptance criteria")
         for criterion in effectiveCriteria {
             lines.append("- [ ] \(criterion)")
+        }
+        if !attachments.isEmpty {
+            lines.append("")
+            lines.append("## Attachments")
+            lines.append("Reference files for this feature (absolute paths). Read them before you start; they are part of the specification.")
+            lines.append(contentsOf: Self.attachmentLines(attachments))
         }
         lines.append("")
         lines.append("## Working agreement")

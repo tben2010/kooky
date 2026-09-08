@@ -52,9 +52,11 @@ final class KanbanStoreTests: XCTestCase {
 
         var edited = card
         edited.title = "Renamed"
+        edited.attachments = ["/tmp/spec.md"]
         edited.column = .done   // must be ignored — `move` owns the column
         store.update(edited)
         XCTAssertEqual(store.card(id: card.id)?.title, "Renamed")
+        XCTAssertEqual(store.card(id: card.id)?.attachments, ["/tmp/spec.md"])
         XCTAssertEqual(store.card(id: card.id)?.column, .backlog)
 
         store.remove(id: card.id)
