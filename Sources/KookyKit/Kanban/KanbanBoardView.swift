@@ -175,7 +175,8 @@ struct KanbanBoardView: View {
                 }
             }
         } label: {
-            Image(systemName: "chevron.down")
+            Label(String(localized: "Filter cards by project", bundle: bundle), systemImage: "chevron.down")
+                .labelStyle(.iconOnly)
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(Theme.chromeMuted)
         }
@@ -551,7 +552,7 @@ struct KanbanBoardView: View {
         noticeDismissal?.cancel()
         withAnimation(.easeOut(duration: 0.15)) { notice = new }
         noticeDismissal = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: (new.tone == .failure ? 8 : 4) * 1_000_000_000)
+            try? await Task.sleep(for: .seconds(new.tone == .failure ? 8 : 4))
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.2)) { notice = nil }
         }
@@ -661,7 +662,9 @@ private struct HorizontalScrollHost<Content: View>: NSViewRepresentable {
         (scroll.documentView as? NSHostingView<Content>)?.rootView = content()
         scroll.tile()
         let model = model
-        DispatchQueue.main.async {
+        // Deferred one tick: observable writes during `updateNSView` would
+        // re-enter SwiftUI's update.
+        Task { @MainActor in
             model.offset = scroll.contentView.bounds.origin.x
             model.visibleWidth = scroll.contentSize.width
             model.contentWidth = scroll.documentView?.frame.width ?? 0

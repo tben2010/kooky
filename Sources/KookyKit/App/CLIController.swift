@@ -258,8 +258,18 @@ final class KookyCLIController {
             case .moved where !deadInProgress:
                 return completion(ok(note: "card \"\(card.title)\" is already running — nothing launched"))
             case .moved, .needsLaunch:
-                Task { @MainActor in
-                    if let failure = await KanbanLaunchCoordinator.launch(cardId: card.id, board: board, store: context.store) {
+                Task { @MainActor [weak self] in
+                    let failure = await KanbanLaunchCoordinator.launch(cardId: card.id, board: board, store: context.store)
+                    // The launch is board state the user sees, not a throwaway
+                    // `-e` — so no request deadline here. Shutdown still wins:
+                    // the ⌘Q drain has flushed the board, and a tab spawned
+                    // into a store that is being torn down must not report
+                    // success.
+                    guard let self, !self.isShuttingDown() else {
+                        completion(.failure("kooky is shutting down"))
+                        return
+                    }
+                    if let failure {
                         completion(self.refuse("launch failed: \(failure)"))
                     } else {
                         let launched = board.card(id: card.id)
@@ -299,17 +309,35 @@ final class KookyCLIController {
         let criteria = request.criteria.map(KanbanCard.criteria(fromLines:)) ?? []
         let requestedBranch = request.branch?.trimmingCharacters(in: .whitespacesAndNewlines)
         let cwdURL = URL(fileURLWithPath: cwd)
-        Task { @MainActor in
-            let resolved: (root: URL, branch: String)? = await Task.detached(priority: .userInitiated) {
+        // Same gates as `open`: the stat + git probe is bounded by a race
+        // (a dead mount never returns), and nothing is created once the
+        // request is stale or the app is on its way out — `board.add` after
+        // the ⌘Q flush would be a card that exists for one second.
+        let deadline = RequestDeadline(Self.asyncVerbDeadline)
+        Task { @MainActor [weak self] in
+            let probe: (root: URL, branch: String)?? = await withOffMainTimeout(Self.directoryProbeBudget) {
                 var isDirectory: ObjCBool = false
                 guard FileManager.default.fileExists(atPath: cwdURL.path, isDirectory: &isDirectory), isDirectory.boolValue,
                       let root = WorktreeManager.repoRoot(near: cwdURL)
                 else { return nil }
                 if let requestedBranch, !requestedBranch.isEmpty { return (root, requestedBranch) }
                 return (root, KanbanRepoInfo.load(projectRoot: root).defaultBranch)
-            }.value
-            guard let resolved else {
-                return completion(self.refuse("\(cwd) is not inside a git repository — cards belong to a repo"))
+            }
+            guard let self, !self.isShuttingDown() else {
+                completion(.failure("kooky is shutting down"))
+                return
+            }
+            guard let resolution = probe else {
+                completion(.failure("checking \(cwd) timed out — is it on an unreachable network volume?"))
+                return
+            }
+            guard let resolved = resolution else {
+                completion(self.refuse("\(cwd) is not inside a git repository — cards belong to a repo"))
+                return
+            }
+            guard !deadline.hasExpired else {
+                completion(.failure("kooky took too long to answer; no card was created"))
+                return
             }
             let card = KanbanCard(
                 title: title,

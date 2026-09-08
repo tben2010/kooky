@@ -27,15 +27,14 @@ enum KanbanCardDrafter {
     /// `cwd` and returns stdout. A login shell because the app's own PATH
     /// (LaunchServices) doesn't know where `claude` lives — the user's
     /// shell does, same as every kooky terminal.
-    nonisolated(unsafe) static var runner: @Sendable (_ shellCommand: String, _ cwd: URL) async -> Result<String, DraftError> = { command, cwd in
-        await Task.detached(priority: .userInitiated) {
-            runInLoginShell(command, cwd: cwd)
-        }.value
+    static var runner: @Sendable (_ shellCommand: String, _ cwd: URL) async -> Result<String, DraftError> = { command, cwd in
+        await runInLoginShell(command, cwd: cwd, timeout: timeout)
     }
 
-    /// Seconds before a headless run is killed — generous, the agent may
-    /// actually read code, but a hung run must not strand the editor.
-    nonisolated static let timeout: TimeInterval = 180
+    /// How long a headless run may take before it is killed — generous,
+    /// the agent may actually read code, but a hung run must not strand
+    /// the editor.
+    nonisolated static let timeout: Duration = .seconds(180)
 
     /// True when "draft with agent" can work for this template.
     static func supports(_ template: AgentTemplate?) -> Bool {
@@ -160,10 +159,27 @@ enum KanbanCardDrafter {
 
     // MARK: - Process
 
-    /// Blocking; callers hop off the main actor. `zsh -lc` so the user's
-    /// PATH applies; KOOKY_* session vars are stripped so the headless run
-    /// can't ping this window's hooks or trip the agent-launch guard.
-    nonisolated private static func runInLoginShell(_ command: String, cwd: URL) -> Result<String, DraftError> {
+    /// What one headless run ended as, before it is turned into a message.
+    private enum RunEvent: Sendable {
+        case exited(Int32)
+        case stdout(Data)
+        case stderr(Data)
+        case timedOut
+    }
+
+    /// Message for a run the calling task cancelled (the editor closed).
+    nonisolated static let cancelledMessage = "draft cancelled"
+
+    /// Runs `command` through `zsh -lc` in `cwd` so the user's PATH applies;
+    /// KOOKY_* session vars are stripped so the headless run can't ping
+    /// this window's hooks or trip the agent-launch guard.
+    ///
+    /// Nothing here blocks a thread: the exit arrives through
+    /// `terminationHandler`, both pipes are drained with `FileHandle.bytes`
+    /// (so a chatty agent can't deadlock on a full pipe), and the timeout is
+    /// a sleeping child task racing the exit. Cancelling the calling task
+    /// terminates the process — closing the editor kills the agent.
+    nonisolated static func runInLoginShell(_ command: String, cwd: URL, timeout: Duration) async -> Result<String, DraftError> {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         process.arguments = ["-lc", command]
@@ -174,37 +190,101 @@ enum KanbanCardDrafter {
         let stdout = Pipe(), stderr = Pipe()
         process.standardOutput = stdout
         process.standardError = stderr
+        // Installed BEFORE `run()`: a process that exits at once would
+        // otherwise fire into nothing, and the exit wait below would hang.
+        let (exits, exitSink) = AsyncStream.makeStream(of: Int32.self)
+        process.terminationHandler = { finished in
+            exitSink.yield(finished.terminationStatus)
+            exitSink.finish()
+        }
         do {
             try process.run()
         } catch {
             return .failure(DraftError(message: "couldn't start the agent: \(error.localizedDescription)"))
         }
-        // Drain on background threads so a chatty agent can't deadlock on a
-        // full pipe while we wait for exit.
-        let outData = DrainBox(), errData = DrainBox()
-        let group = DispatchGroup()
-        group.enter(); DispatchQueue.global().async { outData.data = stdout.fileHandleForReading.readDataToEndOfFile(); group.leave() }
-        group.enter(); DispatchQueue.global().async { errData.data = stderr.fileHandleForReading.readDataToEndOfFile(); group.leave() }
-        let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning, Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.2)
+
+        var status: Int32?
+        var output = Data()
+        var errors = Data()
+        var timedOut = false
+        await withTaskCancellationHandler {
+            await withTaskGroup(of: RunEvent.self) { group in
+                group.addTask {
+                    var iterator = exits.makeAsyncIterator()
+                    return .exited(await iterator.next() ?? -1)
+                }
+                group.addTask { .stdout(await drain(stdout.fileHandleForReading)) }
+                group.addTask { .stderr(await drain(stderr.fileHandleForReading)) }
+                group.addTask {
+                    try? await Task.sleep(for: timeout)
+                    return .timedOut
+                }
+                // Exit + both pipes; once all three are in, the sleeper is
+                // cancelled instead of waiting out the full timeout.
+                var outstanding = 3
+                for await event in group {
+                    switch event {
+                    case .exited(let code):
+                        status = code
+                        outstanding -= 1
+                    case .stdout(let data):
+                        output = data
+                        outstanding -= 1
+                    case .stderr(let data):
+                        errors = data
+                        outstanding -= 1
+                    case .timedOut:
+                        // The sleeper also reports in when it is cancelled
+                        // below — only a timeout that beats the exit counts.
+                        guard status == nil, !Task.isCancelled else { continue }
+                        timedOut = true
+                        if process.isRunning { process.terminate() }
+                        group.cancelAll()
+                        continue
+                    }
+                    if outstanding == 0 { group.cancelAll() }
+                }
+            }
+        } onCancel: {
+            if process.isRunning { process.terminate() }
         }
-        if process.isRunning {
-            process.terminate()
-            return .failure(DraftError(message: "the agent didn't answer within \(Int(timeout))s"))
+
+        if Task.isCancelled {
+            return .failure(DraftError(message: cancelledMessage))
         }
-        group.wait()
-        let output = String(data: outData.data, encoding: .utf8) ?? ""
-        guard process.terminationStatus == 0 else {
-            let error = singleLine(String((String(data: errData.data, encoding: .utf8) ?? "").prefix(160)))
-            return .failure(DraftError(message: "agent exited with status \(process.terminationStatus)\(error.isEmpty ? "" : ": \(error)")"))
+        if timedOut {
+            return .failure(DraftError(message: "the agent didn't answer within \(timeout.components.seconds)s"))
         }
-        return .success(output)
+        guard let status, status == 0 else {
+            let error = singleLine(String((String(data: errors, encoding: .utf8) ?? "").prefix(160)))
+            return .failure(DraftError(message: "agent exited with status \(status ?? -1)\(error.isEmpty ? "" : ": \(error)")"))
+        }
+        return .success(String(data: output, encoding: .utf8) ?? "")
     }
 
-    /// Reference box for the pipe drains — written once per thread before
-    /// `group.wait()` provides the happens-before edge.
-    private final class DrainBox: @unchecked Sendable {
+    /// Everything the handle delivers until EOF; whatever arrived so far
+    /// when the read is cancelled.
+    ///
+    /// `readabilityHandler` (a per-handle dispatch source), not
+    /// `FileHandle.bytes`: two concurrent `bytes` iterations share one
+    /// reader, and the idle stderr read starves the stdout one — stdout
+    /// stalled after ~36 KB while the agent blocked on a full pipe.
+    nonisolated private static func drain(_ handle: FileHandle) async -> Data {
+        let (chunks, sink) = AsyncStream.makeStream(of: Data.self)
+        handle.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                // EOF — the writer closed its end.
+                handle.readabilityHandler = nil
+                sink.finish()
+            } else {
+                sink.yield(chunk)
+            }
+        }
         var data = Data()
+        // Ends at EOF, or early when the task is cancelled.
+        for await chunk in chunks { data.append(chunk) }
+        handle.readabilityHandler = nil
+        return data
     }
 }

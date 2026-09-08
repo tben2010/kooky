@@ -46,12 +46,12 @@ struct TabBarItem: View {
         // Selection is a discrete navigation state, not a layout transition.
         // Animating it delays the visual handoff while the terminal surface is
         // already being switched underneath.
-        .transaction { transaction in
-            if isActive { transaction.animation = nil }
-        }
+        // Scoped to `isActive` so the hover fade below still animates on
+        // the active tab.
+        .transaction(value: isActive) { $0.animation = nil }
         .animation(.easeOut(duration: 0.12), value: isHovered)
-        .overlay(RightClickCatcher { _ in isContextMenuOpen = true })
-        .overlay(MiddleClickCatcher { onClose() })
+        .overlay { RightClickCatcher { _ in isContextMenuOpen = true } }
+        .overlay { MiddleClickCatcher(action: onClose) }
         .popover(isPresented: $isContextMenuOpen, arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 0) {
                 KookyMenuRow(title: "Close Tab", shortcut: "⌘W") {

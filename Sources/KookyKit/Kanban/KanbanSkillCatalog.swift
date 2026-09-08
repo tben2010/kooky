@@ -40,13 +40,13 @@ enum KanbanSkillCatalog {
             if seen.insert(skill.name).inserted { skills.append(skill) }
         }
         if let projectRoot {
-            let claudeDir = projectRoot.appendingPathComponent(".claude", isDirectory: true)
-            for skill in skillDirectories(in: claudeDir.appendingPathComponent("skills"), scope: .project, fileManager: fileManager) { add(skill) }
-            for skill in commandFiles(in: claudeDir.appendingPathComponent("commands"), scope: .project, fileManager: fileManager) { add(skill) }
+            let claudeDir = projectRoot.appending(path: ".claude", directoryHint: .isDirectory)
+            for skill in skillDirectories(in: claudeDir.appending(path: "skills"), scope: .project, fileManager: fileManager) { add(skill) }
+            for skill in commandFiles(in: claudeDir.appending(path: "commands"), scope: .project, fileManager: fileManager) { add(skill) }
         }
-        let userClaude = home.appendingPathComponent(".claude", isDirectory: true)
-        for skill in skillDirectories(in: userClaude.appendingPathComponent("skills"), scope: .user, fileManager: fileManager) { add(skill) }
-        for skill in commandFiles(in: userClaude.appendingPathComponent("commands"), scope: .user, fileManager: fileManager) { add(skill) }
+        let userClaude = home.appending(path: ".claude", directoryHint: .isDirectory)
+        for skill in skillDirectories(in: userClaude.appending(path: "skills"), scope: .user, fileManager: fileManager) { add(skill) }
+        for skill in commandFiles(in: userClaude.appending(path: "commands"), scope: .user, fileManager: fileManager) { add(skill) }
         for skill in pluginSkills(claudeDir: userClaude, fileManager: fileManager) { add(skill) }
         return skills
     }
@@ -60,7 +60,7 @@ enum KanbanSkillCatalog {
         return entries
             .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
             .compactMap { folder in
-                let manifest = folder.appendingPathComponent("SKILL.md")
+                let manifest = folder.appending(path: "SKILL.md")
                 guard fileManager.fileExists(atPath: manifest.path) else { return nil }
                 let front = frontmatter(of: manifest)
                 let base = front["name"] ?? folder.lastPathComponent
@@ -107,7 +107,7 @@ enum KanbanSkillCatalog {
     }
 
     private static func pluginSkills(claudeDir: URL, fileManager: FileManager) -> [KanbanSkill] {
-        let manifest = claudeDir.appendingPathComponent("plugins/installed_plugins.json")
+        let manifest = claudeDir.appending(path: "plugins/installed_plugins.json")
         guard let data = try? Data(contentsOf: manifest),
               let installed = try? JSONDecoder().decode(InstalledPlugins.self, from: data) else { return [] }
         var result: [KanbanSkill] = []
@@ -116,7 +116,7 @@ enum KanbanSkillCatalog {
             // namespace is the plugin name alone.
             let plugin = key.split(separator: "@", maxSplits: 1).first.map(String.init) ?? key
             for entry in entries {
-                let skillsDir = URL(fileURLWithPath: entry.installPath).appendingPathComponent("skills")
+                let skillsDir = URL(fileURLWithPath: entry.installPath).appending(path: "skills")
                 result += skillDirectories(in: skillsDir, scope: .plugin, namespace: plugin, fileManager: fileManager)
             }
         }
@@ -188,21 +188,21 @@ enum KanbanModelSuggestions {
         switch template?.rosterId {
         case AgentTemplate.claudeCodeID:
             let candidates = [
-                projectRoot?.appendingPathComponent(".claude/settings.local.json"),
-                projectRoot?.appendingPathComponent(".claude/settings.json"),
-                home.appendingPathComponent(".claude/settings.json"),
+                projectRoot?.appending(path: ".claude/settings.local.json"),
+                projectRoot?.appending(path: ".claude/settings.json"),
+                home.appending(path: ".claude/settings.json"),
             ].compactMap { $0 }
             info.defaultModel = candidates.lazy.compactMap { jsonString(at: $0, keyPath: ["model"]) }.first
         case "codex":
             let candidates = [
-                projectRoot?.appendingPathComponent(".codex/config.toml"),
-                home.appendingPathComponent(".codex/config.toml"),
+                projectRoot?.appending(path: ".codex/config.toml"),
+                home.appending(path: ".codex/config.toml"),
             ].compactMap { $0 }
             info.defaultModel = candidates.lazy.compactMap { tomlTopLevelString(at: $0, key: "model") }.first
         case "gemini", "antigravity":
             let candidates = [
-                projectRoot?.appendingPathComponent(".gemini/settings.json"),
-                home.appendingPathComponent(".gemini/settings.json"),
+                projectRoot?.appending(path: ".gemini/settings.json"),
+                home.appending(path: ".gemini/settings.json"),
             ].compactMap { $0 }
             info.defaultModel = candidates.lazy.compactMap {
                 jsonString(at: $0, keyPath: ["model"]) ?? jsonString(at: $0, keyPath: ["model", "name"])

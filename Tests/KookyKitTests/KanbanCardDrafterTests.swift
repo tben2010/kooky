@@ -165,4 +165,47 @@ final class KanbanCardDrafterTests: XCTestCase {
         let unsupported = await KanbanCardDrafter.draft(title: "T", requirement: "", criteria: [], projectRoot: root, template: .droid, model: nil)
         if case .success = unsupported { XCTFail("droid has no headless drafting") }
     }
+
+    // MARK: - Process runner (real zsh)
+
+    private let shellCwd = FileManager.default.temporaryDirectory
+
+    func testRunnerReturnsStdoutOfASuccessfulCommand() async throws {
+        let result = await KanbanCardDrafter.runInLoginShell(#"printf '{"requirement":"r"}'"#, cwd: shellCwd, timeout: .seconds(30))
+        XCTAssertEqual(try result.get(), #"{"requirement":"r"}"#)
+    }
+
+    /// More than the 64 KB pipe buffer: the drains must run while the
+    /// process is still writing, or it would block on a full pipe and the
+    /// exit would never come.
+    func testRunnerDrainsOutputLargerThanThePipeBuffer() async throws {
+        let result = await KanbanCardDrafter.runInLoginShell("head -c 300000 /dev/zero | tr '\\0' x", cwd: shellCwd, timeout: .seconds(30))
+        XCTAssertEqual(try result.get().count, 300_000)
+    }
+
+    func testRunnerReportsExitStatusWithStderrHead() async {
+        let result = await KanbanCardDrafter.runInLoginShell("echo boom >&2; exit 3", cwd: shellCwd, timeout: .seconds(30))
+        XCTAssertEqual(result, .failure(.init(message: "agent exited with status 3: boom")))
+    }
+
+    func testRunnerTimesOutAndTerminatesTheProcess() async {
+        let clock = ContinuousClock()
+        let start = clock.now
+        let result = await KanbanCardDrafter.runInLoginShell("sleep 30", cwd: shellCwd, timeout: .milliseconds(500))
+        XCTAssertEqual(result, .failure(.init(message: "the agent didn't answer within 0s")))
+        XCTAssertLessThan(clock.now - start, .seconds(10), "returns right after the timeout, not after the 30s sleep")
+    }
+
+    func testCancellingTheCallerTerminatesTheProcess() async {
+        let clock = ContinuousClock()
+        let start = clock.now
+        let run = Task {
+            await KanbanCardDrafter.runInLoginShell("sleep 30", cwd: shellCwd, timeout: .seconds(60))
+        }
+        try? await Task.sleep(for: .milliseconds(300))
+        run.cancel()
+        let result = await run.value
+        XCTAssertEqual(result, .failure(.init(message: KanbanCardDrafter.cancelledMessage)))
+        XCTAssertLessThan(clock.now - start, .seconds(10), "cancel kills the agent instead of waiting it out")
+    }
 }

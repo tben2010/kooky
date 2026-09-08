@@ -15,7 +15,11 @@ final class KanbanPhase2Tests: XCTestCase {
 
     // MARK: - Fixtures
 
-    private func makeController(store: WorkspaceStore, board: KanbanStore) -> KookyCLIController {
+    private func makeController(
+        store: WorkspaceStore,
+        board: KanbanStore,
+        isShuttingDown: @escaping @MainActor () -> Bool = { false }
+    ) -> KookyCLIController {
         let context = KookyCLIController.WindowContext(
             store: store,
             isKey: true,
@@ -27,6 +31,7 @@ final class KanbanPhase2Tests: XCTestCase {
             windows: { [context] },
             fallbackWindow: { (context, false) },
             activateApp: {},
+            isShuttingDown: isShuttingDown,
             templates: { AgentTemplate.builtin },
             board: { board },
             resume: { _, _, _, _, completion in completion(.opened) }
@@ -213,6 +218,37 @@ final class KanbanPhase2Tests: XCTestCase {
         // The id is the third word so scripts can feed it to --start.
         let words = (response.note ?? "").split(separator: " ")
         XCTAssertEqual(words.count > 2 ? String(words[2]) : "", card.id.uuidString)
+    }
+
+    /// The ⌘Q drain has flushed the board by the time the off-main probe
+    /// returns — a card added now lives for one second and is lost. Same
+    /// gate the `open` verb applies after its own hop.
+    func testCardNewRefusesAfterShutdownBeganInsteadOfCreatingALostCard() async throws {
+        let repo = try makeGitRepo()
+        let store = makeTestStore()
+        let board = KanbanStore(persistence: InMemoryKanbanPersistence())
+        let controller = makeController(store: store, board: board, isShuttingDown: { true })
+        let response = await respond(controller, KookyCLIRequest(
+            verb: .card,
+            cwd: repo.path,
+            title: "Late",
+            cardAction: "new"
+        ))
+        XCTAssertFalse(response.ok)
+        XCTAssertEqual(response.error, "kooky is shutting down")
+        XCTAssertTrue(board.cards.isEmpty)
+    }
+
+    func testCardStartReportsShutdownInsteadOfSuccess() async throws {
+        let store = makeTestStore()
+        let board = KanbanStore(persistence: InMemoryKanbanPersistence())
+        let controller = makeController(store: store, board: board, isShuttingDown: { true })
+        let card = KanbanCard(title: "Late", requirement: "R", acceptanceCriteria: ["A"], projectRoot: projectA, agentId: AgentTemplate.claudeCodeID)
+        board.add(card)
+        _ = board.move(card.id, to: .ready)
+        let response = await respond(controller, KookyCLIRequest(verb: .card, cardAction: "start", cardId: card.id.uuidString))
+        XCTAssertFalse(response.ok)
+        XCTAssertEqual(response.error, "kooky is shutting down")
     }
 
     func testCardNewHonoursExplicitAgentAndBranch() async throws {

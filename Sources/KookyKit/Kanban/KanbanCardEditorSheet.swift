@@ -37,6 +37,9 @@ struct KanbanCardEditorSheet: View {
     @State private var isDrafting = false
     @State private var draftError: String?
     @State private var draftProposal: KanbanCardDraft?
+    /// The running "draft with agent" round-trip — cancelled when the sheet
+    /// goes away, which terminates the headless agent process.
+    @State private var draftTask: Task<Void, Never>?
     /// Attachments as opened — cancelling deletes managed files (pasted
     /// screenshots) added since, so a discarded edit leaves no husks.
     private let originalAttachments: [String]
@@ -139,6 +142,7 @@ struct KanbanCardEditorSheet: View {
     /// A field with an optional trailing menu of suggestions. The menu
     /// only writes into the text — free text is always allowed.
     private func suggestionField<Content: View>(
+        title: String,
         text: Binding<String>,
         placeholder: String,
         disabled: Bool = false,
@@ -152,7 +156,8 @@ struct KanbanCardEditorSheet: View {
             Menu {
                 menu()
             } label: {
-                Image(systemName: "chevron.down")
+                Label(title, systemImage: "chevron.down")
+                    .labelStyle(.iconOnly)
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(Theme.chromeMuted)
             }
@@ -210,28 +215,34 @@ struct KanbanCardEditorSheet: View {
         .preferredColorScheme(Theme.chromeColorScheme)
         .task {
             let root = draft.projectRoot
-            async let scanned = Task.detached(priority: .utility) {
-                KanbanSkillCatalog.scan(projectRoot: root)
-            }.value
-            async let repo = Task.detached(priority: .userInitiated) {
-                KanbanRepoInfo.load(projectRoot: root)
-            }.value
+            // `async let` children run off the main actor and are cancelled
+            // with this task when the sheet goes away — no detached tasks
+            // that would outlive it.
+            async let scanned = KanbanSkillCatalog.scan(projectRoot: root)
+            async let repo = KanbanRepoInfo.load(projectRoot: root)
             let loaded = await repo
+            guard !Task.isCancelled else { return }
             repoInfo = loaded
             // A fresh card starts on the main checkout's branch — "work on
             // main" is the default, a feature branch is the `+` button.
             if draft.branchName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !launchFieldsLocked {
                 draft.branchName = loaded.defaultBranch
             }
-            skills = await scanned
+            let found = await scanned
+            guard !Task.isCancelled else { return }
+            skills = found
         }
         .task(id: draft.agentId) {
             let root = draft.projectRoot
             let template = selectedTemplate
-            modelInfo = await Task.detached(priority: .utility) {
-                KanbanModelSuggestions.resolve(for: template, projectRoot: root)
-            }.value
+            async let resolved = KanbanModelSuggestions.resolve(for: template, projectRoot: root)
+            let info = await resolved
+            // Switching agents restarts this task; the previous one may
+            // still be mid-await and must not land its (older) result.
+            guard !Task.isCancelled else { return }
+            modelInfo = info
         }
+        .onDisappear { draftTask?.cancel() }
     }
 
     // MARK: Sections
@@ -304,7 +315,7 @@ struct KanbanCardEditorSheet: View {
             }
             HStack(alignment: .top, spacing: 14) {
                 field("agent") {
-                    Picker("", selection: $draft.agentId) {
+                    Picker(String(localized: "Agent", bundle: bundle), selection: $draft.agentId) {
                         ForEach(agents) { agent in
                             Text(agent.title).tag(agent.id)
                         }
@@ -316,7 +327,11 @@ struct KanbanCardEditorSheet: View {
                     .labelsHidden()
                 }
                 field("model") {
-                    suggestionField(text: $modelText, placeholder: defaultModelLabel) {
+                    suggestionField(
+                        title: String(localized: "Model suggestions", bundle: bundle),
+                        text: $modelText,
+                        placeholder: defaultModelLabel
+                    ) {
                         choice(defaultModelLabel, isSelected: modelText.isEmpty) { modelText = "" }
                         if !modelSuggestions.isEmpty {
                             Divider()
@@ -331,7 +346,11 @@ struct KanbanCardEditorSheet: View {
                     }
                 }
                 field("skill") {
-                    suggestionField(text: $skillText, placeholder: String(localized: "none", bundle: bundle)) {
+                    suggestionField(
+                        title: String(localized: "Skill suggestions", bundle: bundle),
+                        text: $skillText,
+                        placeholder: String(localized: "none", bundle: bundle)
+                    ) {
                         choice(String(localized: "none", bundle: bundle), isSelected: skillText.isEmpty) { skillText = "" }
                         if offersSkillPicker {
                             ForEach(KanbanSkill.Scope.allCases, id: \.self) { scope in
@@ -364,6 +383,7 @@ struct KanbanCardEditorSheet: View {
             field("branch") {
                 HStack(spacing: 8) {
                     suggestionField(
+                        title: String(localized: "Branch suggestions", bundle: bundle),
                         text: $draft.branchName,
                         placeholder: repoInfo?.defaultBranch ?? "main",
                         disabled: launchFieldsLocked
@@ -475,7 +495,8 @@ struct KanbanCardEditorSheet: View {
         let root = draft.projectRoot
         let template = selectedTemplate
         let model = modelText.trimmingCharacters(in: .whitespacesAndNewlines)
-        Task { @MainActor in
+        draftTask?.cancel()
+        draftTask = Task { @MainActor in
             let result = await KanbanCardDrafter.draft(
                 title: title,
                 requirement: requirement,
@@ -485,6 +506,7 @@ struct KanbanCardEditorSheet: View {
                 template: template,
                 model: model.isEmpty ? nil : model
             )
+            guard !Task.isCancelled else { return }
             isDrafting = false
             switch result {
             case .success(let proposal):
@@ -528,7 +550,7 @@ struct KanbanCardEditorSheet: View {
         }
         .padding(12)
         .background(Theme.activityRunning.opacity(0.06))
-        .overlay(Rectangle().stroke(Theme.activityRunning.opacity(0.5), lineWidth: 1))
+        .overlay { Rectangle().stroke(Theme.activityRunning.opacity(0.5), lineWidth: 1) }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
@@ -565,10 +587,10 @@ struct KanbanCardEditorSheet: View {
                 }
             }
             .padding(4)
-            .overlay(
+            .overlay {
                 Rectangle()
                     .stroke(Theme.activityRunning.opacity(isDropTargeted ? 0.8 : 0), lineWidth: 1)
-            )
+            }
             .background(Theme.activityRunning.opacity(isDropTargeted ? 0.06 : 0))
             .onDrop(of: [.fileURL, .image], isTargeted: $isDropTargeted) { providers in
                 acceptDrop(providers)
@@ -607,15 +629,15 @@ struct KanbanCardEditorSheet: View {
                     .bracketBorder()
             }
             Spacer(minLength: 0)
-            Button {
+            let removeTitle = String(localized: managed ? "Remove attachment — deletes the screenshot Kooky saved" : "Remove attachment", bundle: bundle)
+            Button(removeTitle, systemImage: "xmark") {
                 draft.attachments.removeAll { $0 == path }
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(Theme.chromeMuted)
             }
+            .labelStyle(.iconOnly)
+            .font(.system(size: 9, weight: .medium))
+            .foregroundStyle(Theme.chromeMuted)
             .buttonStyle(.plain)
-            .help(String(localized: managed ? "Remove attachment — deletes the screenshot Kooky saved" : "Remove attachment", bundle: bundle))
+            .help(removeTitle)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 5)

@@ -102,7 +102,7 @@ struct KanbanCard: Codable, Equatable, Identifiable, Sendable {
         skill: String? = nil,
         attachments: [String] = [],
         branchName: String? = nil,
-        now: Date = Date()
+        now: Date = Date.now
     ) {
         self.id = id
         self.title = title
@@ -241,7 +241,9 @@ struct KanbanCard: Codable, Equatable, Identifiable, Sendable {
 
     /// Test seam for "does this attachment still exist" — the prompt and the
     /// editor both mark files that went away instead of dropping them.
-    nonisolated(unsafe) static var attachmentExists: @Sendable (_ path: String) -> Bool = { path in
+    /// Main-actor bound like every reader (launch, drafter, editor row), so
+    /// a test's override and the reads can't race.
+    @MainActor static var attachmentExists: @Sendable (_ path: String) -> Bool = { path in
         FileManager.default.fileExists(atPath: path)
     }
 
@@ -260,6 +262,7 @@ struct KanbanCard: Codable, Equatable, Identifiable, Sendable {
 
     /// One Markdown bullet per attachment, absolute path in backticks,
     /// missing files flagged in place (never silently skipped).
+    @MainActor
     static func attachmentLines(_ paths: [String]) -> [String] {
         paths.map { path in
             attachmentExists(path)
@@ -272,7 +275,8 @@ struct KanbanCard: Codable, Equatable, Identifiable, Sendable {
     /// are passed in (not read from self) so the prompt describes the
     /// launch that is actually happening, not a stale pin. `isWorktree`
     /// picks the wording: a card on the main checkout's branch works in the
-    /// repo itself.
+    /// repo itself. Main-actor bound through `attachmentLines`.
+    @MainActor
     func promptText(workingDirectory: URL, branch: String, isWorktree: Bool) -> String {
         var lines: [String] = []
         if let skill = skill?.trimmingCharacters(in: .whitespacesAndNewlines), !skill.isEmpty {
@@ -311,11 +315,11 @@ struct KanbanCard: Codable, Equatable, Identifiable, Sendable {
 
     // MARK: Mutation helpers
 
-    mutating func touch(now: Date = Date()) {
+    mutating func touch(now: Date = Date.now) {
         updatedAt = now
     }
 
-    mutating func record(_ message: String, now: Date = Date()) {
+    mutating func record(_ message: String, now: Date = Date.now) {
         events.append(KanbanEvent(timestamp: now, message: message))
         if events.count > Self.eventCap {
             events.removeFirst(events.count - Self.eventCap)

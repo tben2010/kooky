@@ -280,7 +280,7 @@ struct SidebarWorkspaceRow: View {
                         isContextMenuOpen = false
                         // Same one-tick deferral as Create Worktree: let the
                         // menu popover dismiss before the board swaps in.
-                        DispatchQueue.main.async { onNewCard() }
+                        Task { @MainActor in onNewCard() }
                     }
                 }
                 if let onGoToSource {

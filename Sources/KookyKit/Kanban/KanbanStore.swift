@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Storage seam for the board. `FileKanbanPersistence` is production;
 /// tests inject an in-memory one so they never touch `board.json`.
@@ -23,20 +24,24 @@ protocol KanbanPersistence {
 @MainActor
 struct FileKanbanPersistence: KanbanPersistence {
     static var defaultFileURL: URL {
-        AppPersistence.dataDirectory.appendingPathComponent("board.json")
+        AppPersistence.dataDirectory.appending(path: "board.json")
     }
 
     static var defaultArchiveFileURL: URL {
-        AppPersistence.dataDirectory.appendingPathComponent("archive.json")
+        AppPersistence.dataDirectory.appending(path: "archive.json")
     }
 
     /// Versioned envelope so a future shape change can branch on `version`
-    /// the way `AppPersistence.loadFromDisk` tries new-then-legacy.
+    /// the way `AppPersistence.loadFromDisk` tries new-then-legacy. A file
+    /// from a newer build is treated like an unreadable one: set aside,
+    /// never overwritten by this build's smaller understanding of it.
     private struct Envelope: Codable {
         static let currentVersion = 1
         var version: Int
         var cards: [KanbanCard]
     }
+
+    private static let logger = Logger(subsystem: "kooky", category: "kanban-persistence")
 
     let fileURL: URL
     let archiveFileURL: URL
@@ -47,7 +52,7 @@ struct FileKanbanPersistence: KanbanPersistence {
     init(fileURL: URL = FileKanbanPersistence.defaultFileURL, archiveFileURL: URL? = nil) {
         self.fileURL = fileURL
         self.archiveFileURL = archiveFileURL
-            ?? fileURL.deletingLastPathComponent().appendingPathComponent("archive.json")
+            ?? fileURL.deletingLastPathComponent().appending(path: "archive.json")
     }
 
     func load() -> [KanbanCard]? { read(from: fileURL) }
@@ -55,19 +60,59 @@ struct FileKanbanPersistence: KanbanPersistence {
     func loadArchive() -> [KanbanCard]? { read(from: archiveFileURL) }
     func saveArchive(_ cards: [KanbanCard]) { write(cards, to: archiveFileURL) }
 
+    /// Where an unreadable file ends up: `board.json` →
+    /// `board.unreadable-20260908T101500.json` beside it. The store then
+    /// starts empty, and the next save writes a fresh file without
+    /// destroying whatever the old one held.
+    static func quarantineURL(for url: URL, now: Date = .now) -> URL {
+        let stamp = now.formatted(.iso8601.year().month().day().dateSeparator(.omitted)
+            .time(includingFractionalSeconds: false).timeSeparator(.omitted))
+        let name = url.deletingPathExtension().lastPathComponent
+        return url.deletingLastPathComponent()
+            .appending(path: "\(name).unreadable-\(stamp).json")
+    }
+
+    /// nil = no file yet, or one this build can't read. The unreadable
+    /// case is logged and the file moved aside (see `quarantineURL`); it
+    /// is never silently treated as "empty board, fine to overwrite".
     private func read(from url: URL) -> [KanbanCard]? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return (try? decoder.decode(Envelope.self, from: data))?.cards
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        do {
+            let data = try Data(contentsOf: url)
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let envelope = try decoder.decode(Envelope.self, from: data)
+            guard envelope.version <= Envelope.currentVersion else {
+                setAside(url, reason: "written by a newer build (version \(envelope.version))")
+                return nil
+            }
+            return envelope.cards
+        } catch {
+            setAside(url, reason: String(describing: error))
+            return nil
+        }
+    }
+
+    private func setAside(_ url: URL, reason: String) {
+        let target = Self.quarantineURL(for: url)
+        do {
+            try FileManager.default.moveItem(at: url, to: target)
+            Self.logger.error("\(url.lastPathComponent, privacy: .public) is unreadable (\(reason, privacy: .public)); moved to \(target.lastPathComponent, privacy: .public)")
+        } catch {
+            Self.logger.error("\(url.lastPathComponent, privacy: .public) is unreadable (\(reason, privacy: .public)) and could not be moved aside: \(String(describing: error), privacy: .public)")
+        }
     }
 
     private func write(_ cards: [KanbanCard], to url: URL) {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(Envelope(version: Envelope.currentVersion, cards: cards)) else { return }
-        try? data.write(to: url, options: .atomic)
+        do {
+            let data = try encoder.encode(Envelope(version: Envelope.currentVersion, cards: cards))
+            try data.write(to: url, options: .atomic)
+        } catch {
+            Self.logger.error("saving \(url.lastPathComponent, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+        }
     }
 }
 
@@ -108,7 +153,7 @@ final class KanbanStore {
     private var autoArchiveTask: Task<Void, Never>?
     /// Same 1s debounce as `WorkspaceStore` — typing in the editor must
     /// not hit disk per keystroke.
-    private static let saveDebounce: UInt64 = 1_000_000_000
+    private static let saveDebounce: Duration = .seconds(1)
 
     /// `internal` so tests build isolated instances. Production uses `.shared`.
     init(persistence: any KanbanPersistence) {
@@ -162,7 +207,7 @@ final class KanbanStore {
     /// worktree pin, branch and history travel with the card so a restore
     /// puts back exactly what left.
     @discardableResult
-    func archive(id: UUID, now: Date = Date()) -> Bool {
+    func archive(id: UUID, now: Date = Date.now) -> Bool {
         guard let idx = cards.firstIndex(where: { $0.id == id }), cards[idx].column == .done else { return false }
         var card = cards.remove(at: idx)
         card.record("archived", now: now)
@@ -175,7 +220,7 @@ final class KanbanStore {
     /// archived copy says — the archive only ever holds Done cards, and a
     /// restore must never resurrect a card into In Progress.
     @discardableResult
-    func unarchive(id: UUID, now: Date = Date()) -> Bool {
+    func unarchive(id: UUID, now: Date = Date.now) -> Bool {
         guard let idx = archived.firstIndex(where: { $0.id == id }) else { return false }
         var card = archived.remove(at: idx)
         card.column = .done
@@ -188,7 +233,7 @@ final class KanbanStore {
     /// Archive every Done card of `project` (nil = all projects). Returns
     /// how many moved.
     @discardableResult
-    func archiveAllDone(project: URL?, now: Date = Date()) -> Int {
+    func archiveAllDone(project: URL?, now: Date = Date.now) -> Int {
         let ids = cards(in: .done, project: project).map(\.id)
         for id in ids { archive(id: id, now: now) }
         return ids.count
@@ -199,7 +244,7 @@ final class KanbanStore {
     /// event, not `updatedAt`, so a note added yesterday keeps the card
     /// on the board. Returns how many moved.
     @discardableResult
-    func autoArchive(doneOlderThan days: Int, now: Date = Date()) -> Int {
+    func autoArchive(doneOlderThan days: Int, now: Date = Date.now) -> Int {
         guard days > 0 else { return 0 }
         let cutoff = now.addingTimeInterval(-TimeInterval(days) * 86_400)
         let stale = cards.filter { card in
@@ -212,14 +257,14 @@ final class KanbanStore {
     /// Run the auto-archive sweep now and once a day from then on. `days`
     /// is read on every tick (nil = the setting is off), so a change in
     /// Settings applies at the next tick without a restart.
-    static let autoArchiveInterval: TimeInterval = 24 * 3_600
+    static let autoArchiveInterval: Duration = .seconds(24 * 3_600)
     func startAutoArchive(days: @escaping @MainActor () -> Int?) {
         autoArchiveTask?.cancel()
         autoArchiveTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
                 if let days = days() { self.autoArchive(doneOlderThan: days) }
-                try? await Task.sleep(nanoseconds: UInt64(Self.autoArchiveInterval) * 1_000_000_000)
+                try? await Task.sleep(for: Self.autoArchiveInterval)
             }
         }
     }
@@ -237,7 +282,7 @@ final class KanbanStore {
     }
 
     /// Seconds since the card's last `launched …` event; nil if never.
-    func secondsSinceLaunch(id: UUID, now: Date = Date()) -> TimeInterval? {
+    func secondsSinceLaunch(id: UUID, now: Date = Date.now) -> TimeInterval? {
         guard let card = card(id: id),
               let launched = card.events.last(where: { $0.message.hasPrefix("launched") }) else { return nil }
         return now.timeIntervalSince(launched.timestamp)
@@ -249,7 +294,7 @@ final class KanbanStore {
     /// so the board never shows "review this" for work that never began.
     static let quickExitWindow: TimeInterval = 15
     @discardableResult
-    func agentFinished(sessionId: UUID, now: Date = Date()) -> KanbanColumn? {
+    func agentFinished(sessionId: UUID, now: Date = Date.now) -> KanbanColumn? {
         guard let card = card(launchedSession: sessionId), card.column == .inProgress else { return nil }
         if let elapsed = secondsSinceLaunch(id: card.id, now: now), elapsed < Self.quickExitWindow {
             markLaunchFailed(id: card.id, message: "agent exited \(Int(elapsed))s after start")
@@ -263,7 +308,7 @@ final class KanbanStore {
     /// Progress or was just auto-moved to In Review by the trailing
     /// `completed`, that isn't a finished feature: back to Ready with the
     /// status on record.
-    func agentFailed(sessionId: UUID, exitCode: Int, now: Date = Date()) {
+    func agentFailed(sessionId: UUID, exitCode: Int, now: Date = Date.now) {
         guard let card = card(everLaunchedSession: sessionId),
               let idx = cards.firstIndex(where: { $0.id == card.id }) else { return }
         // Still the running launch, or the auto-move to In Review that the
@@ -436,7 +481,7 @@ final class KanbanStore {
         if archive { archiveDirty = true }
         pendingSave?.cancel()
         pendingSave = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: Self.saveDebounce)
+            try? await Task.sleep(for: Self.saveDebounce)
             guard let self, !Task.isCancelled else { return }
             self.persistence.save(self.cards)
             if self.archiveDirty {

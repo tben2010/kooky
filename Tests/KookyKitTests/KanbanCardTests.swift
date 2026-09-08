@@ -1,6 +1,7 @@
 import XCTest
 @testable import KookyKit
 
+@MainActor
 final class KanbanCardTests: XCTestCase {
     private let root = URL(fileURLWithPath: "/tmp/kanban-project")
 

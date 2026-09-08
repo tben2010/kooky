@@ -224,6 +224,58 @@ final class KanbanStoreTests: XCTestCase {
         try? FileManager.default.removeItem(at: url)
     }
 
+    /// An unreadable board must survive the store starting empty: it is
+    /// moved aside on load, so the first save afterwards writes a fresh
+    /// file instead of overwriting whatever the old one held.
+    func testUnreadableBoardIsMovedAsideNotOverwritten() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kooky-board-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("board.json")
+        try "not json".write(to: url, atomically: true, encoding: .utf8)
+        let persistence = FileKanbanPersistence(fileURL: url)
+
+        let store = KanbanStore(persistence: persistence)
+        XCTAssertTrue(store.cards.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path), "unreadable file is moved aside on load")
+        let setAside = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.hasPrefix("board.unreadable-") && $0.hasSuffix(".json") }
+        XCTAssertEqual(setAside.count, 1)
+
+        store.add(readyCard())
+        store.flush()
+        XCTAssertEqual(persistence.load()?.count, 1, "fresh board written")
+        let kept = try String(contentsOf: dir.appendingPathComponent(setAside[0]), encoding: .utf8)
+        XCTAssertEqual(kept, "not json", "the old bytes are still there for recovery")
+    }
+
+    /// A board written by a newer build is set aside the same way — this
+    /// build must not rewrite it with the parts it happens to understand.
+    func testBoardFromNewerVersionIsMovedAside() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kooky-board-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("board.json")
+        try #"{"version": 99, "cards": []}"#.write(to: url, atomically: true, encoding: .utf8)
+
+        XCTAssertNil(FileKanbanPersistence(fileURL: url).load())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        let setAside = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.hasPrefix("board.unreadable-") }
+        XCTAssertEqual(setAside.count, 1)
+    }
+
+    func testQuarantineURLKeepsNameAndTimestamp() {
+        let url = URL(fileURLWithPath: "/tmp/x/board.json")
+        let stamp = Date(timeIntervalSince1970: 1_800_000_000)
+        let aside = FileKanbanPersistence.quarantineURL(for: url, now: stamp)
+        XCTAssertEqual(aside.deletingLastPathComponent().path, "/tmp/x")
+        XCTAssertTrue(aside.lastPathComponent.hasPrefix("board.unreadable-2027"), aside.lastPathComponent)
+        XCTAssertTrue(aside.lastPathComponent.hasSuffix(".json"))
+    }
+
     // MARK: - Archive
 
     func testArchiveMovesDoneCardOutOfCardsIntoArchivedWithHistory() {

@@ -74,7 +74,7 @@ enum KanbanLaunchCoordinator {
     /// Does the agent still have this conversation on disk? Resuming an id
     /// it can't find makes the CLI exit at once — the board would then read
     /// that exit as "done". Test seam; production asks the session scanner.
-    nonisolated(unsafe) static var conversationExists: @Sendable (_ agentRosterId: String, _ conversationId: String) -> Bool = { agent, id in
+    static var conversationExists: @Sendable (_ agentRosterId: String, _ conversationId: String) -> Bool = { agent, id in
         AgentSessionScanner.findRecordInDefaultRoot(agentId: agent, conversationId: id) != nil
     }
 
@@ -119,7 +119,7 @@ enum KanbanLaunchCoordinator {
             sourceName: projectRoot.lastPathComponent,
             branch: branch
         )
-        return projectRoot.deletingLastPathComponent().appendingPathComponent(name)
+        return projectRoot.deletingLastPathComponent().appending(path: name)
     }
 
     /// `<modelFlag> <model>` for the card's agent, or nil when the model is
@@ -169,7 +169,7 @@ enum KanbanLaunchCoordinator {
     /// - any other existing branch → a new worktree checking it out;
     /// - an unknown branch → created from HEAD in a new worktree.
     static func launch(cardId: UUID, board: KanbanStore, store: WorkspaceStore) async -> String? {
-        guard let card = board.card(id: cardId) else { return "card not found" }
+        guard var card = board.card(id: cardId) else { return "card not found" }
         guard let template = AgentTemplate.all.first(where: { $0.id == card.agentId }), !template.isShell else {
             let message = "agent \(card.agentId) is not available"
             board.markLaunchFailed(id: cardId, message: message)
@@ -178,9 +178,14 @@ enum KanbanLaunchCoordinator {
         if store.mainContent == .kanban {
             store.setMainContent(.kanbanSplit)
         }
-        let source = sourceWorkspace(for: card.projectRoot, in: store)
-        let branch = card.branchName
-        let extraOptions = modelOptions(template: template, model: card.model)
+        // The awaits below run git / filesystem work for hundreds of ms.
+        // A card dragged back out of In Progress (or deleted) meanwhile
+        // must not get a session stamped on it — re-read after each hop
+        // and stop when it's no longer launching.
+        func stillLaunching() -> KanbanCard? {
+            guard let current = board.card(id: cardId), current.column == .inProgress else { return nil }
+            return current
+        }
         // A captured conversation id + an agent that can resume → pick the
         // old conversation back up (it already holds the card's context).
         // The prompt is dropped on purpose: kooky treats a prompt as "fresh
@@ -189,15 +194,22 @@ enum KanbanLaunchCoordinator {
         var resumeId: String? = nil
         if template.supportsResume, let stored = card.conversationId {
             let roster = template.rosterId
+            // Read on the main actor; only the captured value crosses over.
+            let check = conversationExists
             let exists = await Task.detached(priority: .userInitiated) {
-                conversationExists(roster, stored)
+                check(roster, stored)
             }.value
+            guard let current = stillLaunching() else { return launchAbandonedMessage }
+            card = current
             if exists {
                 resumeId = stored
             } else {
                 board.dropConversationId(id: cardId)
             }
         }
+
+        let source = sourceWorkspace(for: card.projectRoot, in: store)
+        var extraOptions = modelOptions(template: template, model: card.model)
 
         // Re-entry into a worktree the card already owns: adopt it instead
         // of asking git for a second checkout of the same branch.
@@ -212,6 +224,10 @@ enum KanbanLaunchCoordinator {
         let info = await Task.detached(priority: .userInitiated) {
             KanbanRepoInfo.load(projectRoot: projectRoot)
         }.value
+        guard let current = stillLaunching() else { return launchAbandonedMessage }
+        card = current
+        let branch = card.branchName
+        extraOptions = modelOptions(template: template, model: card.model)
 
         switch info.plan(for: branch) {
         case .inPlace:
@@ -264,6 +280,10 @@ enum KanbanLaunchCoordinator {
             }
         }
     }
+
+    /// Returned by `launch` when the card left In Progress while the launch
+    /// was still resolving git — the user's move wins, no tab is opened.
+    static let launchAbandonedMessage = "launch abandoned — the card left In Progress"
 
     /// Tab in an existing worktree directory: the sidebar workspace for it
     /// if one is open, else a new child workspace under `source`.

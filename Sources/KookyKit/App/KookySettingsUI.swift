@@ -1464,19 +1464,20 @@ struct KookySettingsView: View {
             SettingsSection(title: "Kanban") {
                 SettingsRow(label: "archive-done-cards") {
                     HStack(spacing: 8) {
-                        Text(String.localizedStringWithFormat(
-                            String(localized: "after %d days", bundle: .kookyResources),
-                            model.kanbanAutoArchiveDays
-                        ))
+                        Text("^[after \(model.kanbanAutoArchiveDays) day](inflect: true)", bundle: .kookyResources)
                         .font(Theme.mono(12))
                         .foregroundStyle(model.kanbanAutoArchiveEnabled ? Theme.chromeForeground : Theme.chromeMuted)
                         .monospacedDigit()
-                        Stepper("", value: $model.kanbanAutoArchiveDays, in: 1...365)
-                            .labelsHidden()
-                            .disabled(!model.kanbanAutoArchiveEnabled)
-                        Toggle("", isOn: $model.kanbanAutoArchiveEnabled)
-                            .labelsHidden()
-                            .toggleStyle(.switch)
+                        Stepper(value: $model.kanbanAutoArchiveDays, in: 1...365) {
+                            Text("Days before a Done card is archived", bundle: .kookyResources)
+                        }
+                        .labelsHidden()
+                        .disabled(!model.kanbanAutoArchiveEnabled)
+                        Toggle(isOn: $model.kanbanAutoArchiveEnabled) {
+                            Text("Archive Done cards automatically", bundle: .kookyResources)
+                        }
+                        .labelsHidden()
+                        .toggleStyle(.switch)
                     }
                 }
                 SettingsCaption("Done cards whose last activity is older than this move to the archive at launch and once a day.")

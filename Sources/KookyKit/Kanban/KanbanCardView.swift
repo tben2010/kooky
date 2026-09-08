@@ -148,23 +148,62 @@ struct KanbanCardView: View {
         }
         .contentShape(Rectangle())
         .onHover { isHovered = $0 }
-        .onTapGesture(count: 2) { onOpen() }
-        .onTapGesture(count: 1) {
-            guard !isArchived else { return }
-            if live != nil {
-                onWatch()
-            } else if card.conversationId != nil, !isLaunching {
-                onReopen()
-            } else if card.column == .inProgress, !isLaunching {
-                onRelaunch()
-            }
-        }
+        // Double-click wins: the single click only fires once the
+        // double-click interval has passed without a second click, so
+        // opening the editor never also relaunches or reopens the agent.
+        .gesture(
+            TapGesture(count: 2).onEnded(onOpen)
+                .exclusively(before: TapGesture().onEnded(handleSingleClick))
+        )
         .contextMenu { contextMenu }
         .help(isArchived
               ? String(localized: "Archived · double-click to view", bundle: bundle)
               : live != nil
               ? String(localized: "Click to show the terminal · double-click to edit", bundle: bundle)
               : String(localized: "Double-click to edit", bundle: bundle))
+        // One VoiceOver element per card: its texts read as one label, the
+        // default action edits, the context-menu verbs are custom actions.
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction(.default, onOpen)
+        .accessibilityActions { accessibilityMenu }
+    }
+
+    /// Single click: show the running terminal, or bring the agent back
+    /// when the tab is gone. Archived cards only respond to double-click.
+    private func handleSingleClick() {
+        guard !isArchived else { return }
+        if live != nil {
+            onWatch()
+        } else if card.conversationId != nil, !isLaunching {
+            onReopen()
+        } else if card.column == .inProgress, !isLaunching {
+            onRelaunch()
+        }
+    }
+
+    /// The context menu's verbs as VoiceOver custom actions — plain
+    /// buttons only, which is what `accessibilityActions` accepts.
+    @ViewBuilder
+    private var accessibilityMenu: some View {
+        if isArchived {
+            Button(String(localized: "Restore to Done", bundle: bundle)) { onUnarchive?() }
+        } else {
+            if live != nil {
+                Button(String(localized: "Watch Agent", bundle: bundle), action: onWatch)
+                Button(String(localized: "Open Agent Tab", bundle: bundle), action: onReveal)
+            }
+            if live == nil, card.conversationId != nil, !isLaunching {
+                Button(String(localized: "Reopen Conversation", bundle: bundle), action: onReopen)
+            }
+            if card.column == .inProgress, live == nil, !isLaunching {
+                Button(String(localized: "Relaunch Agent", bundle: bundle), action: onRelaunch)
+            }
+            if card.column == .done, let onArchive {
+                Button(String(localized: "Archive Card", bundle: bundle), action: onArchive)
+            }
+            Button(String(localized: "Delete Card", bundle: bundle), action: onDelete)
+        }
     }
 
     /// Top-right "a terminal is open for this card" mark — shown in every
@@ -188,6 +227,10 @@ struct KanbanCardView: View {
             String(localized: "Terminal open — %@ · click the card to show it", bundle: bundle),
             live?.state.label ?? ""
         ))
+        .accessibilityLabel(String.localizedStringWithFormat(
+            String(localized: "Terminal open — %@", bundle: bundle),
+            live?.state.label ?? ""
+        ))
     }
 
     /// The tab is gone but the agent's conversation is on disk: a muted
@@ -205,6 +248,7 @@ struct KanbanCardView: View {
         .padding(.vertical, 3)
         .bracketBorder()
         .help(String(localized: "Terminal closed — conversation saved · click the card to reopen it", bundle: bundle))
+        .accessibilityLabel(String(localized: "Terminal closed — conversation saved", bundle: bundle))
     }
 
     /// "● running · 12 min · make test" — the line that answers "is it
@@ -216,8 +260,10 @@ struct KanbanCardView: View {
                 Circle().fill(color(for: live.state)).frame(width: 6, height: 6)
                 Text(live.state.label)
                     .foregroundStyle(color(for: live.state))
-                if let elapsed = elapsedSinceLaunch {
-                    Text("· \(elapsed)")
+                if let launchedAt {
+                    // `.relative` keeps itself current — the card otherwise
+                    // has no reason to re-render while the agent runs.
+                    Text("· \(Text(launchedAt, style: .relative))")
                         .foregroundStyle(Theme.chromeMuted.opacity(0.8))
                 }
                 Text("· \(live.tabTitle)")
@@ -243,14 +289,9 @@ struct KanbanCardView: View {
         .font(Theme.mono(10))
     }
 
-    /// Minutes / hours since the last `launched …` event.
-    private var elapsedSinceLaunch: String? {
-        guard let launched = card.events.last(where: { $0.message.hasPrefix("launched") }) else { return nil }
-        let seconds = Int(Date().timeIntervalSince(launched.timestamp))
-        guard seconds >= 0 else { return nil }
-        if seconds < 60 { return "\(seconds)s" }
-        if seconds < 3600 { return "\(seconds / 60) min" }
-        return "\(seconds / 3600) h \((seconds % 3600) / 60) min"
+    /// Timestamp of the last `launched …` event, for the running-time label.
+    private var launchedAt: Date? {
+        card.events.last(where: { $0.message.hasPrefix("launched") })?.timestamp
     }
 
     @ViewBuilder
@@ -263,6 +304,7 @@ struct KanbanCardView: View {
                 .fill(color(for: live.state))
                 .frame(width: 8, height: 8)
                 .help(live.state.label)
+                .accessibilityLabel(live.state.label)
         } else if card.column == .inProgress {
             // Card says running, but no live tab backs it (app relaunch,
             // tab closed): show a hollow dot so the gap is visible.
@@ -270,6 +312,7 @@ struct KanbanCardView: View {
                 .stroke(Theme.chromeMuted, lineWidth: 1)
                 .frame(width: 8, height: 8)
                 .help(String(localized: "no live agent tab", bundle: bundle))
+                .accessibilityLabel(String(localized: "no live agent tab", bundle: bundle))
         }
     }
 

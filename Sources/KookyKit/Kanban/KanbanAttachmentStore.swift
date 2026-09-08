@@ -17,11 +17,11 @@ enum KanbanAttachmentStore {
     static var rootOverride: URL?
 
     static var root: URL {
-        rootOverride ?? AppPersistence.dataDirectory.appendingPathComponent("attachments", isDirectory: true)
+        rootOverride ?? AppPersistence.dataDirectory.appending(path: "attachments", directoryHint: .isDirectory)
     }
 
     static func directory(for cardId: UUID) -> URL {
-        root.appendingPathComponent(cardId.uuidString, isDirectory: true)
+        root.appending(path: cardId.uuidString, directoryHint: .isDirectory)
     }
 
     /// True when Kooky owns the file (and so may delete it).
@@ -33,14 +33,14 @@ enum KanbanAttachmentStore {
 
     /// Writes `pngData` as `screenshot-<timestamp>.png` (a counter suffix
     /// on collision) into the card's folder and returns the absolute path.
-    static func store(pngData: Data, cardId: UUID, now: Date = Date()) throws -> String {
+    static func store(pngData: Data, cardId: UUID, now: Date = Date.now) throws -> String {
         let directory = directory(for: cardId)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let stamp = Self.stampFormatter.string(from: now)
-        var url = directory.appendingPathComponent("screenshot-\(stamp).png")
+        var url = directory.appending(path: "screenshot-\(stamp).png")
         var counter = 2
         while FileManager.default.fileExists(atPath: url.path) {
-            url = directory.appendingPathComponent("screenshot-\(stamp)-\(counter).png")
+            url = directory.appending(path: "screenshot-\(stamp)-\(counter).png")
             counter += 1
         }
         try pngData.write(to: url, options: .atomic)
@@ -56,7 +56,7 @@ enum KanbanAttachmentStore {
         guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else { return }
         let kept = Set(attachments.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
         for name in names {
-            let url = directory.appendingPathComponent(name)
+            let url = directory.appending(path: name)
             if !kept.contains(url.standardizedFileURL.path) {
                 try? FileManager.default.removeItem(at: url)
             }
@@ -108,7 +108,7 @@ enum KanbanAttachmentImport {
     /// under the card's folder. Returns the paths that were added (already
     /// present paths are skipped, so pasting twice doesn't duplicate).
     @discardableResult
-    static func apply(_ sources: [Source], to attachments: inout [String], cardId: UUID, now: Date = Date()) -> [String] {
+    static func apply(_ sources: [Source], to attachments: inout [String], cardId: UUID, now: Date = Date.now) -> [String] {
         var added: [String] = []
         for source in sources {
             let path: String
