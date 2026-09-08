@@ -139,18 +139,38 @@ final class KookySettingsModelTests: XCTestCase {
         }.first)
     }
 
+    /// Reads go through the pure resolver, never through `KookySettingsModel()`:
+    /// that loads the developer's real ~/.kooky/settings.json, so a machine
+    /// with auto-archive switched on would fail the "defaults off" half.
     func testKanbanAutoArchiveDefaultsOffAndDaysFallBackToDefault() {
-        let model = KookySettingsModel()
-        XCTAssertFalse(model.kanbanAutoArchiveEnabled)
-        XCTAssertNil(model.effectiveKanbanAutoArchiveDays)
+        let absent = KookySettingsModel.resolvedKanbanAutoArchive([:])
+        XCTAssertFalse(absent.enabled)
+        XCTAssertEqual(absent.days, KookySettingsModel.defaultKanbanAutoArchiveDays)
+        let configured = KookySettingsModel.resolvedKanbanAutoArchive(["autoArchive": true, "autoArchiveDays": 14])
+        XCTAssertTrue(configured.enabled)
+        XCTAssertEqual(configured.days, 14)
+        let handEdited = KookySettingsModel.resolvedKanbanAutoArchive(["autoArchive": "yes", "autoArchiveDays": "14"])
+        XCTAssertFalse(handEdited.enabled, "a non-bool is not an opt-in")
+        XCTAssertEqual(handEdited.days, KookySettingsModel.defaultKanbanAutoArchiveDays)
         XCTAssertEqual(KookySettingsModel.resolvedKanbanAutoArchiveDays(nil), KookySettingsModel.defaultKanbanAutoArchiveDays)
         XCTAssertEqual(KookySettingsModel.resolvedKanbanAutoArchiveDays(0), KookySettingsModel.defaultKanbanAutoArchiveDays)
         XCTAssertEqual(KookySettingsModel.resolvedKanbanAutoArchiveDays(-3), KookySettingsModel.defaultKanbanAutoArchiveDays)
         XCTAssertEqual(KookySettingsModel.resolvedKanbanAutoArchiveDays("14"), KookySettingsModel.defaultKanbanAutoArchiveDays)
         XCTAssertEqual(KookySettingsModel.resolvedKanbanAutoArchiveDays(14), 14)
-        model.kanbanAutoArchiveEnabled = true
+    }
+
+    /// `effectiveKanbanAutoArchiveDays` is what the sweep reads: nil while
+    /// off, never below one day while on. Set on the model directly so the
+    /// user's file plays no part.
+    func testEffectiveKanbanAutoArchiveDaysIsNilWhileOffAndAtLeastOneWhileOn() {
+        let model = KookySettingsModel()
+        model.kanbanAutoArchiveEnabled = false
         model.kanbanAutoArchiveDays = 14
+        XCTAssertNil(model.effectiveKanbanAutoArchiveDays)
+        model.kanbanAutoArchiveEnabled = true
         XCTAssertEqual(model.effectiveKanbanAutoArchiveDays, 14)
+        model.kanbanAutoArchiveDays = 0
+        XCTAssertEqual(model.effectiveKanbanAutoArchiveDays, 1)
     }
 
     func testShowSearchPillDefaultsToVisible() {

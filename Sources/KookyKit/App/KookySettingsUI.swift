@@ -316,6 +316,16 @@ final class KookySettingsModel {
         guard let days = raw as? Int, days > 0 else { return defaultKanbanAutoArchiveDays }
         return days
     }
+
+    /// The `kanban` section of settings.json as the two model fields — off
+    /// and the default day count when absent. Pure, like the other
+    /// `resolved…` readers, so tests never depend on the user's real file.
+    static func resolvedKanbanAutoArchive(_ kanban: [String: Any]) -> (enabled: Bool, days: Int) {
+        (
+            enabled: (kanban["autoArchive"] as? Bool) ?? false,
+            days: resolvedKanbanAutoArchiveDays(kanban["autoArchiveDays"])
+        )
+    }
     /// "Open in" picker (top-chrome split button): user-customised order of
     /// `OpenInApp` ids; installed apps absent from this list follow in catalog
     /// order. Persisted under `openin.order`.
@@ -442,9 +452,9 @@ final class KookySettingsModel {
         notifyOnAttention = (notifications["attention"] as? Bool) ?? true
         notifyOnFailure = (notifications["failure"] as? Bool) ?? true
 
-        let kanban = parsed["kanban"] as? [String: Any] ?? [:]
-        kanbanAutoArchiveEnabled = (kanban["autoArchive"] as? Bool) ?? false
-        kanbanAutoArchiveDays = Self.resolvedKanbanAutoArchiveDays(kanban["autoArchiveDays"])
+        let kanban = Self.resolvedKanbanAutoArchive(parsed["kanban"] as? [String: Any] ?? [:])
+        kanbanAutoArchiveEnabled = kanban.enabled
+        kanbanAutoArchiveDays = kanban.days
 
         let openin = parsed["openin"] as? [String: Any] ?? [:]
         openInAppOrder = (openin["order"] as? [String]) ?? []
