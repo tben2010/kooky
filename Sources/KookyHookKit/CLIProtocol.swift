@@ -72,7 +72,8 @@ public enum KookyCLIVerb: String, Sendable {
     case status
     case rename
     /// Kanban card round-trip from an agent tab: `--done` / `--note` /
-    /// `--show`. Additive verb — an older app answers "unknown verb".
+    /// `--show`, plus `--new` to create a card from a script. Additive
+    /// verb — an older app answers "unknown verb".
     case card
 }
 
@@ -102,13 +103,22 @@ public struct KookyCLIRequest: Codable, Equatable, Sendable {
     /// activation, no window fronting, and the tab is not made its pane's
     /// active tab.
     public var noFocus: Bool?
-    /// `card`: one of `done` / `note` / `show`.
+    /// `card`: one of `new` / `start` / `done` / `note` / `show`.
     public var cardAction: String?
     /// `card --id`: the card UUID. Optional — without it the app resolves
     /// the card from `surface` (the tab the CLI was invoked in).
     public var cardId: String?
     /// `card --note`: free text appended to the card's history.
     public var note: String?
+    /// `card --new --requirement`: the card's requirement text (Markdown).
+    /// `title` / `cwd` / `agent` are reused for the card's title, project
+    /// directory and agent template.
+    public var requirement: String?
+    /// `card --new --criteria`: acceptance criteria, one per line.
+    public var criteria: String?
+    /// `card --new --branch`: the branch the card launches on; absent →
+    /// the repo's current branch.
+    public var branch: String?
     /// `$KOOKY_SURFACE_ID` of the invoking tab, when the CLI runs inside
     /// a kooky session. Lets an agent say `kooky-cli card --done` without
     /// repeating the card id. Optional on the wire like every additive field.
@@ -126,7 +136,10 @@ public struct KookyCLIRequest: Codable, Equatable, Sendable {
         cardAction: String? = nil,
         cardId: String? = nil,
         note: String? = nil,
-        surface: String? = nil
+        surface: String? = nil,
+        requirement: String? = nil,
+        criteria: String? = nil,
+        branch: String? = nil
     ) {
         self.kind = KookyCLIProtocol.kind
         self.protocolVersion = KookyCLIProtocol.version
@@ -142,6 +155,9 @@ public struct KookyCLIRequest: Codable, Equatable, Sendable {
         self.cardId = cardId
         self.note = note
         self.surface = surface
+        self.requirement = requirement
+        self.criteria = criteria
+        self.branch = branch
     }
 }
 

@@ -151,6 +151,24 @@ struct KanbanCard: Codable, Equatable, Identifiable, Sendable {
     /// `feature/<slug>` from the title — lowercase, ASCII-folded, dashes
     /// for anything git or a shell would trip on. Empty title → empty slug
     /// so the editor's validation (not a silent `feature/`) catches it.
+    /// One criterion per non-empty line; pasted markdown checklists and
+    /// bullets lose their marker. Shared by the editor's text field and
+    /// `kooky-cli card --new --criteria`.
+    static func criteria(fromLines text: String) -> [String] {
+        text
+            .split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+            .map { line in
+                var l = line
+                for prefix in ["- [ ] ", "- [x] ", "- ", "* ", "• "] where l.hasPrefix(prefix) {
+                    l.removeFirst(prefix.count)
+                    break
+                }
+                return l
+            }
+            .filter { !$0.isEmpty }
+    }
+
     static func suggestedBranchName(for title: String) -> String {
         let folded = title
             .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .init(identifier: "en"))

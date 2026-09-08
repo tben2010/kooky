@@ -620,19 +620,7 @@ struct KanbanCardEditorSheet: View {
     /// The draft with the free-text fields folded in — what `save` gets.
     private var pendingCard: KanbanCard {
         var card = draft
-        card.acceptanceCriteria = criteriaText
-            .split(whereSeparator: \.isNewline)
-            .map { String($0).trimmingCharacters(in: .whitespaces) }
-            .map { line in
-                // Tolerate pasted markdown checklists / bullets.
-                var l = line
-                for prefix in ["- [ ] ", "- [x] ", "- ", "* ", "• "] where l.hasPrefix(prefix) {
-                    l.removeFirst(prefix.count)
-                    break
-                }
-                return l
-            }
-            .filter { !$0.isEmpty }
+        card.acceptanceCriteria = KanbanCard.criteria(fromLines: criteriaText)
         let model = modelText.trimmingCharacters(in: .whitespacesAndNewlines)
         card.model = model.isEmpty ? nil : model
         let skill = skillText.trimmingCharacters(in: .whitespacesAndNewlines)

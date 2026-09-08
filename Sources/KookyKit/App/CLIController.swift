@@ -211,6 +211,9 @@ final class KookyCLIController {
     /// (`surface`), matched against the card that launched that session.
     private func handleCard(_ request: KookyCLIRequest, completion: @escaping @MainActor (KookyCLIResponse) -> Void) {
         let board = board()
+        if request.cardAction == "new" {
+            return handleNewCard(request, board: board, completion: completion)
+        }
         let card: KanbanCard
         if let raw = request.cardId {
             guard let id = UUID(uuidString: raw) else {
@@ -262,6 +265,55 @@ final class KookyCLIController {
             }
         }
         completion(handleCardSync(request, card: card, board: board))
+    }
+
+    /// `card --new`: a Backlog card for the repo around `cwd`. The git root
+    /// and (when `--branch` is absent) the checked-out branch come from a
+    /// subprocess, so both resolve off the main actor — same reason `open`
+    /// stats its cwd there. Nothing is launched; the note carries the id
+    /// so a script can follow up with `card --start --id`.
+    private func handleNewCard(_ request: KookyCLIRequest, board: KanbanStore, completion: @escaping @MainActor (KookyCLIResponse) -> Void) {
+        guard let title = request.title.flatMap(normalizedTitle) else {
+            return completion(refuse("--title needs text"))
+        }
+        guard let cwd = request.cwd, !cwd.isEmpty else {
+            return completion(refuse("card --new needs --cwd <dir> (a directory inside the project's git repository)"))
+        }
+        guard cwd.hasPrefix("/") else {
+            return completion(refuse("cwd must be an absolute path"))
+        }
+        let agentId = request.agent ?? AgentTemplate.claudeCodeID
+        guard let template = lookupTemplate(agentId) else {
+            let known = templates().map(\.id).joined(separator: ", ")
+            return completion(refuse("unknown agent template '\(agentId)' — known templates: \(known)"))
+        }
+        let requirement = request.requirement?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let criteria = request.criteria.map(KanbanCard.criteria(fromLines:)) ?? []
+        let requestedBranch = request.branch?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cwdURL = URL(fileURLWithPath: cwd)
+        Task { @MainActor in
+            let resolved: (root: URL, branch: String)? = await Task.detached(priority: .userInitiated) {
+                var isDirectory: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: cwdURL.path, isDirectory: &isDirectory), isDirectory.boolValue,
+                      let root = WorktreeManager.repoRoot(near: cwdURL)
+                else { return nil }
+                if let requestedBranch, !requestedBranch.isEmpty { return (root, requestedBranch) }
+                return (root, KanbanRepoInfo.load(projectRoot: root).defaultBranch)
+            }.value
+            guard let resolved else {
+                return completion(self.refuse("\(cwd) is not inside a git repository — cards belong to a repo"))
+            }
+            let card = KanbanCard(
+                title: title,
+                requirement: requirement,
+                acceptanceCriteria: criteria,
+                projectRoot: resolved.root,
+                agentId: template.id,
+                branchName: resolved.branch
+            )
+            board.add(card)
+            completion(self.ok(note: "created card \(card.id.uuidString) — \"\(card.title)\" in Backlog of \(resolved.root.path) on \(card.branchName)"))
+        }
     }
 
     private func handleCardSync(_ request: KookyCLIRequest, card: KanbanCard, board: KanbanStore) -> KookyCLIResponse {

@@ -83,7 +83,7 @@ func printSuccess(_ response: KookyCLIResponse, for command: KookyCLICommand) {
         // One line either way; the id stays the third word for scripts.
         let head = response.tabId.map { "opened tab \(KookyHookKit.plain($0))" } ?? "opened"
         print(response.note.map { "\(head) — \(KookyHookKit.plain($0))" } ?? head)
-    case .resume, .focus, .close, .rename, .card:
+    case .resume, .focus, .close, .rename, .card, .newCard:
         print(KookyHookKit.plain(response.note ?? "ok"))
     case .help:
         break
@@ -123,6 +123,27 @@ case .resume(let agent, let id, let cwd):
         agent: agent,
         id: id,
         cwd: cwd.map { KookyHookKit.normalizeCLIPath($0, relativeTo: processCwd) }
+    )
+case .newCard(let title, let requirement, let requirementFile, let criteria, let cwd, let agent, let branch):
+    // The project directory defaults to where the CLI runs — `card --new`
+    // from a repo's shell means "a card for this repo". The app resolves
+    // the git root from it and refuses a directory outside git.
+    var text = requirement
+    if let requirementFile {
+        let path = KookyHookKit.normalizeCLIPath(requirementFile, relativeTo: processCwd)
+        guard let data = FileManager.default.contents(atPath: path), let read = String(data: data, encoding: .utf8) else {
+            fail("couldn't read --requirement-file \(path)")
+        }
+        text = read
+    }
+    command = .newCard(
+        title: title,
+        requirement: text,
+        requirementFile: nil,
+        criteria: criteria,
+        cwd: KookyHookKit.normalizeCLIPath(cwd ?? processCwd, relativeTo: processCwd),
+        agent: agent,
+        branch: branch
     )
 default:
     command = parsed

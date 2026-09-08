@@ -443,6 +443,66 @@ final class CLICommandTests: XCTestCase {
         XCTAssertNil(open.cardAction)
     }
 
+    func testParseCardNew() {
+        XCTAssertEqual(
+            parsed(["card", "--new", "--title", "Palette entry", "--requirement", "Add it", "--criteria", "- a\n- b",
+                    "--cwd", "repo", "--agent", "codex", "--branch", "feature/palette"]),
+            .newCard(
+                title: "Palette entry",
+                requirement: "Add it",
+                requirementFile: nil,
+                criteria: "- a\n- b",
+                cwd: "repo",
+                agent: "codex",
+                branch: "feature/palette"
+            )
+        )
+        // Title alone is enough; everything else is the app's default.
+        XCTAssertEqual(
+            parsed(["card", "--new", "--title", "T"]),
+            .newCard(title: "T", requirement: nil, requirementFile: nil, criteria: nil, cwd: nil, agent: nil, branch: nil)
+        )
+        XCTAssertEqual(
+            parsed(["card", "--new", "--title", "T", "--requirement-file", "spec.md"]),
+            .newCard(title: "T", requirement: nil, requirementFile: "spec.md", criteria: nil, cwd: nil, agent: nil, branch: nil)
+        )
+    }
+
+    func testParseCardNewRejectsMissingTitleAndMixedFlags() {
+        XCTAssertNotNil(parseError(["card", "--new"]))
+        XCTAssertNotNil(parseError(["card", "--new", "--title", "  "]))
+        XCTAssertNotNil(parseError(["card", "--new", "--done", "--title", "T"]))
+        XCTAssertNotNil(parseError(["card", "--new", "--title", "T", "--id", UUID().uuidString]))
+        XCTAssertNotNil(parseError(["card", "--new", "--title", "T", "--requirement", "a", "--requirement-file", "b"]))
+        // Creation-only flags on the other actions are a mistake, not noise.
+        XCTAssertNotNil(parseError(["card", "--done", "--title", "T"]))
+        XCTAssertNotNil(parseError(["card", "--show", "--branch", "x"]))
+    }
+
+    func testCardNewRequestMapsFieldsAndDropsTheFile() throws {
+        let request = try XCTUnwrap(KookyHookKit.cliRequest(
+            for: .newCard(title: "T", requirement: "R", requirementFile: "ignored", criteria: "c", cwd: "/repo", agent: "codex", branch: "b"),
+            surfaceId: "S"
+        ))
+        XCTAssertEqual(request.verb, "card")
+        XCTAssertEqual(request.cardAction, "new")
+        XCTAssertEqual(request.title, "T")
+        XCTAssertEqual(request.requirement, "R")
+        XCTAssertEqual(request.criteria, "c")
+        XCTAssertEqual(request.cwd, "/repo")
+        XCTAssertEqual(request.agent, "codex")
+        XCTAssertEqual(request.branch, "b")
+        XCTAssertEqual(request.surface, "S")
+        XCTAssertNil(request.cardId)
+        let line = try XCTUnwrap(request.encodedLine())
+        XCTAssertEqual(try XCTUnwrap(KookyCLIRequest.decode(from: line)), request)
+        // Older verbs stay byte-identical: the new fields never ship there.
+        let done = try XCTUnwrap(KookyHookKit.cliRequest(for: .card(action: "done", id: nil, note: nil)))
+        XCTAssertNil(done.requirement)
+        XCTAssertNil(done.criteria)
+        XCTAssertNil(done.branch)
+    }
+
     func testCardVerbRoundTripsThroughDecoder() throws {
         let request = KookyCLIRequest(verb: .card, cardAction: "note", cardId: "x", note: "hi", surface: "s")
         let line = try XCTUnwrap(request.encodedLine())

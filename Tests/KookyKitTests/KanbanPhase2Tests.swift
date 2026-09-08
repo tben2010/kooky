@@ -134,6 +134,113 @@ final class KanbanPhase2Tests: XCTestCase {
 
     // MARK: - Model flags
 
+    // MARK: - card --new
+
+    /// `<tmp>/<uuid>/repo` on `main` with one commit, plus a `sub/` dir so
+    /// the request can name a directory that is not the root.
+    private func makeGitRepo() throws -> URL {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent("kanban-cli-\(UUID().uuidString)")
+        let repo = base.appendingPathComponent("repo")
+        try FileManager.default.createDirectory(at: repo.appendingPathComponent("sub"), withIntermediateDirectories: true)
+        for args in [
+            ["init", "-q", "-b", "main"],
+            ["config", "user.email", "test@example.com"],
+            ["config", "user.name", "Test"],
+            ["commit", "-q", "--allow-empty", "-m", "init"],
+        ] {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = ["-C", repo.path] + args
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0, "git \(args.joined(separator: " ")) failed")
+        }
+        addTeardownBlock { try? FileManager.default.removeItem(at: base) }
+        return repo
+    }
+
+    func testCardNewCreatesBacklogCardAtRepoRootOnCurrentBranch() async throws {
+        let repo = try makeGitRepo()
+        let store = makeTestStore()
+        let board = KanbanStore(persistence: InMemoryKanbanPersistence())
+        let controller = makeController(store: store, board: board)
+        let response = await respond(controller, KookyCLIRequest(
+            verb: .card,
+            cwd: repo.appendingPathComponent("sub").path,
+            title: "  Palette entry  ",
+            cardAction: "new",
+            requirement: "Add a palette item.\n",
+            criteria: "- [ ] item shows up\n\n* opens the editor\n"
+        ))
+        XCTAssertTrue(response.ok, response.error ?? "")
+        XCTAssertEqual(board.cards.count, 1)
+        let card = try XCTUnwrap(board.cards.first)
+        XCTAssertEqual(card.title, "Palette entry")
+        XCTAssertEqual(card.requirement, "Add a palette item.")
+        XCTAssertEqual(card.acceptanceCriteria, ["item shows up", "opens the editor"])
+        XCTAssertEqual(card.column, .backlog)
+        XCTAssertEqual(card.projectRoot.standardizedFileURL.path, repo.standardizedFileURL.resolvingSymlinksInPath().path)
+        XCTAssertEqual(card.branchName, "main")
+        XCTAssertEqual(card.agentId, AgentTemplate.claudeCodeID)
+        XCTAssertEqual(card.events.map(\.message), ["created"])
+        // The id is the third word so scripts can feed it to --start.
+        let words = (response.note ?? "").split(separator: " ")
+        XCTAssertEqual(words.count > 2 ? String(words[2]) : "", card.id.uuidString)
+    }
+
+    func testCardNewHonoursExplicitAgentAndBranch() async throws {
+        let repo = try makeGitRepo()
+        let store = makeTestStore()
+        let board = KanbanStore(persistence: InMemoryKanbanPersistence())
+        let controller = makeController(store: store, board: board)
+        let response = await respond(controller, KookyCLIRequest(
+            verb: .card, cwd: repo.path, agent: "codex", title: "T", cardAction: "new", branch: "feature/palette"
+        ))
+        XCTAssertTrue(response.ok, response.error ?? "")
+        let card = try XCTUnwrap(board.cards.first)
+        XCTAssertEqual(card.agentId, "codex")
+        XCTAssertEqual(card.branchName, "feature/palette")
+        XCTAssertEqual(card.acceptanceCriteria, [])
+        XCTAssertEqual(card.requirement, "")
+    }
+
+    func testCardNewRefusalsAreReadable() async throws {
+        let repo = try makeGitRepo()
+        let store = makeTestStore()
+        let board = KanbanStore(persistence: InMemoryKanbanPersistence())
+        let controller = makeController(store: store, board: board)
+
+        let blankTitle = await respond(controller, KookyCLIRequest(verb: .card, cwd: repo.path, title: " ", cardAction: "new"))
+        XCTAssertFalse(blankTitle.ok)
+        XCTAssertTrue(blankTitle.error?.contains("--title") == true, blankTitle.error ?? "")
+
+        let noCwd = await respond(controller, KookyCLIRequest(verb: .card, title: "T", cardAction: "new"))
+        XCTAssertFalse(noCwd.ok)
+        XCTAssertTrue(noCwd.error?.contains("--cwd") == true, noCwd.error ?? "")
+
+        let relative = await respond(controller, KookyCLIRequest(verb: .card, cwd: "repo", title: "T", cardAction: "new"))
+        XCTAssertFalse(relative.ok)
+        XCTAssertTrue(relative.error?.contains("absolute") == true, relative.error ?? "")
+
+        let outsideGit = FileManager.default.temporaryDirectory.appendingPathComponent("kanban-nogit-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: outsideGit, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: outsideGit) }
+        let noRepo = await respond(controller, KookyCLIRequest(verb: .card, cwd: outsideGit.path, title: "T", cardAction: "new"))
+        XCTAssertFalse(noRepo.ok)
+        XCTAssertTrue(noRepo.error?.contains("git repository") == true, noRepo.error ?? "")
+
+        let missingDir = await respond(controller, KookyCLIRequest(verb: .card, cwd: "/nonexistent/\(UUID().uuidString)", title: "T", cardAction: "new"))
+        XCTAssertFalse(missingDir.ok)
+
+        let unknownAgent = await respond(controller, KookyCLIRequest(verb: .card, cwd: repo.path, agent: "nope", title: "T", cardAction: "new"))
+        XCTAssertFalse(unknownAgent.ok)
+        XCTAssertTrue(unknownAgent.error?.contains("known templates") == true, unknownAgent.error ?? "")
+
+        XCTAssertTrue(board.cards.isEmpty)
+    }
+
     func testBuiltinModelFlagsAndCustomInheritance() {
         XCTAssertEqual(AgentTemplate.claudeCode.modelFlag, "--model")
         XCTAssertEqual(AgentTemplate.codex.modelFlag, "-m")
