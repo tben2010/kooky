@@ -22,6 +22,22 @@ public enum KookyCLICommand: Equatable, Sendable {
     case close(tab: String)
     case rename(tab: String, title: String)
     case status(json: Bool)
+    /// `card --done | --note <text> | --show [--id <card-uuid>]`. Without
+    /// `--id` the app resolves the card from the invoking tab.
+    case card(action: String, id: String?, note: String?)
+    /// `card --new --title <t> …`: create a Backlog card. `cwd` is the
+    /// project directory (any directory inside the repo; the app resolves
+    /// the root) — nil means the CLI's own cwd, which `main.swift` fills
+    /// in. `requirementFile` is read by the CLI before the request ships.
+    case newCard(
+        title: String,
+        requirement: String?,
+        requirementFile: String?,
+        criteria: String?,
+        cwd: String?,
+        agent: String?,
+        branch: String?
+    )
     case help
 }
 
@@ -76,11 +92,18 @@ extension KookyHookKit {
             boolFlags: ["--json"],
             usage: "usage: kooky-cli status [--json]"
         ),
+        "card": VerbSpec(
+            valueFlags: ["--id", "--note", "--title", "--requirement", "--requirement-file", "--criteria", "--cwd", "--agent", "--branch"],
+            boolFlags: ["--done", "--show", "--start", "--new"],
+            usage: "usage: kooky-cli card (--start | --done | --note <text> | --show) [--id <card-uuid>]"
+                + " | card --new --title <title> [--requirement <text> | --requirement-file <path>]"
+                + " [--criteria <lines>] [--cwd <dir>] [--agent <id>] [--branch <name>]"
+        ),
     ]
 
     private static func unknownVerbFailure(_ verb: String) -> KookyCLIParseFailure {
         KookyCLIParseFailure(
-            "unknown command '\(verb)' — one of: open, resume, list, focus, close, rename, status. Run `kooky-cli --help`."
+            "unknown command '\(verb)' — one of: open, resume, list, focus, close, rename, status, card. Run `kooky-cli --help`."
         )
     }
 
@@ -192,6 +215,43 @@ extension KookyHookKit {
             }
         case "status":
             return .success(.status(json: bools.contains("--json")))
+        case "card":
+            var actions: [String] = []
+            if bools.contains("--new") { actions.append("new") }
+            if bools.contains("--start") { actions.append("start") }
+            if bools.contains("--done") { actions.append("done") }
+            if bools.contains("--show") { actions.append("show") }
+            if values["--note"] != nil { actions.append("note") }
+            guard actions.count == 1, let action = actions.first else {
+                return .failure(KookyCLIParseFailure("card needs exactly one of --new, --start, --done, --note <text>, --show. \(spec.usage)"))
+            }
+            let newOnly = ["--title", "--requirement", "--requirement-file", "--criteria", "--cwd", "--agent", "--branch"]
+            if action == "new" {
+                if values["--id"] != nil {
+                    return .failure(KookyCLIParseFailure("--new creates a card; --id belongs to the other card actions. \(spec.usage)"))
+                }
+                if values["--requirement"] != nil, values["--requirement-file"] != nil {
+                    return .failure(KookyCLIParseFailure("--requirement and --requirement-file are mutually exclusive. \(spec.usage)"))
+                }
+                return require("--title").map { title in
+                    .newCard(
+                        title: title,
+                        requirement: values["--requirement"],
+                        requirementFile: values["--requirement-file"],
+                        criteria: values["--criteria"],
+                        cwd: values["--cwd"],
+                        agent: values["--agent"],
+                        branch: values["--branch"]
+                    )
+                }
+            }
+            if let stray = newOnly.first(where: { values[$0] != nil }) {
+                return .failure(KookyCLIParseFailure("\(stray) only applies to card --new. \(spec.usage)"))
+            }
+            if let raw = values["--id"], UUID(uuidString: raw) == nil {
+                return .failure(KookyCLIParseFailure("--id expects a card UUID — the launch prompt carries it."))
+            }
+            return .success(.card(action: action, id: values["--id"], note: values["--note"]))
         default:
             // Unreachable while the switch covers every verbSpecs key; kept
             // identical to the entry guard so a future verb added to the
@@ -202,7 +262,7 @@ extension KookyHookKit {
 
     /// The wire request for a parsed command; nil for `help` (local-only).
     /// Path normalization is the caller's job — this maps fields verbatim.
-    public static func cliRequest(for command: KookyCLICommand) -> KookyCLIRequest? {
+    public static func cliRequest(for command: KookyCLICommand, surfaceId: String? = nil) -> KookyCLIRequest? {
         switch command {
         case .open(let cwd, let cmd, let agent, let title, let noFocus):
             // `noFocus` ships only when set: an absent optional keeps the
@@ -228,6 +288,22 @@ extension KookyHookKit {
             return KookyCLIRequest(verb: .rename, tab: tab, title: title)
         case .status:
             return KookyCLIRequest(verb: .status)
+        case .card(let action, let id, let note):
+            return KookyCLIRequest(verb: .card, cardAction: action, cardId: id, note: note, surface: surfaceId)
+        case .newCard(let title, let requirement, _, let criteria, let cwd, let agent, let branch):
+            // `requirementFile` never ships: main.swift folds the file's
+            // text into `requirement` before building the request.
+            return KookyCLIRequest(
+                verb: .card,
+                cwd: cwd,
+                agent: agent,
+                title: title,
+                cardAction: "new",
+                surface: surfaceId,
+                requirement: requirement,
+                criteria: criteria,
+                branch: branch
+            )
         case .help:
             return nil
         }
@@ -275,6 +351,26 @@ extension KookyHookKit {
                                   set a tab's title (clear it in-app)
           status [--json]         app version + protocol; exits 1 when
                                   kooky isn't running
+          card (--start | --done | --note <text> | --show) [--id <card-uuid>]
+                                  Kanban board round-trip: --start moves
+                                  the card to In Progress and launches its
+                                  agent (like dragging it there);
+                                  --done moves the card to In Review,
+                                  --note appends to its history, --show
+                                  prints it (an archived card shows
+                                  "archived: yes"). Inside a kooky tab the
+                                  card is found from the tab; --id overrides.
+          card --new --title <title> [--requirement <text> | --requirement-file <path>]
+               [--criteria <one per line>] [--cwd <dir>] [--agent <template-id>]
+               [--branch <name>]
+                                  create a Backlog card for the repository
+                                  around <dir> (default: the current
+                                  directory). --criteria takes one
+                                  acceptance criterion per line; bullets
+                                  and checkboxes are stripped. --agent
+                                  defaults to claude-code, --branch to the
+                                  repo's current branch. Prints the card
+                                  id — hand it to card --start.
 
         Exit code 0 means the request was accepted; anything else prints one
         reason line on stderr. Every command except `status` launches kooky

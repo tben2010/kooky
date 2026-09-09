@@ -712,6 +712,13 @@ enum KookyShellIntegration {
             // var there), so emitting them locally would double-report and
             // risk leaking OSC bytes into a redirected agent's stdout.
             "PATH": "\(kookyBinDirectory):\(parentPath)",
+            // The bridge rc launches KOOKY_AGENT only while this is unset.
+            // A kooky started from INSIDE a kooky agent tab (`swift run`,
+            // lldb — anything that isn't LaunchServices) inherits the parent
+            // shell's `=1` and would silently spawn plain shells for every
+            // agent tab. Empty passes the rc's `-z` test; a normal launch
+            // never had it set, so this is a no-op there.
+            "KOOKY_AGENT_LAUNCHED": "",
             // Gemini CLI loads this as the lowest-precedence settings tier,
             // but its hooks arrays use CONCAT-merge — so our entries fire
             // alongside whatever the user has in `~/.gemini/settings.json`,

@@ -10,24 +10,38 @@ struct ContentView: View {
     let paneHost: PaneTreeHostView
     /// Narrow AppKit seam: the store remains the source of truth for sidebar
     /// state; the owning window controller only mirrors those widths into
-    /// `NSWindow.minSize`. `true` asks it to animate a required expansion
-    /// after a mode toggle; drag-driven width changes stay immediate.
-    var onWindowLayoutChange: (Bool) -> Void = { _ in }
+    /// `NSWindow.minSize`. `expandIfNeeded` asks it to grow the window frame
+    /// to the new minimum when it's narrower (mode toggles, pane-tree
+    /// changes); drag-driven width changes pass `false` — the window must
+    /// never jump while a sidebar drag is in flight. `animate` animates that
+    /// expansion (mode toggles only).
+    var onWindowLayoutChange: (_ expandIfNeeded: Bool, _ animate: Bool) -> Void = { _, _ in }
 
     var body: some View {
         VStack(spacing: 0) {
             topStrip
             Rectangle().fill(Theme.chromeSeparator).frame(height: 1)
-            HStack(spacing: 0) {
-                if store.sidebarMode != .hidden {
-                    SidebarView(store: store, mode: store.sidebarMode)
-                    Rectangle().fill(Theme.chromeSeparator).frame(width: 1)
-                }
-                mainPane
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                if store.rightSidebarMode != .hidden {
-                    Rectangle().fill(Theme.chromeSeparator).frame(width: 1)
-                    AgentOverviewSidebar(store: store, mode: store.rightSidebarMode)
+
+            GeometryReader { geo in
+                ZStack(alignment: .topLeading) {
+                    if store.sidebarMode != .hidden {
+                        SidebarView(store: store, mode: store.sidebarMode)
+                            .frame(width: sidebarWidth)
+                        Rectangle().fill(Theme.chromeSeparator)
+                            .frame(width: 1)
+                            .offset(x: sidebarWidth)
+                    }
+                    mainPane
+                        .frame(width: terminalWidth(in: geo.size.width), height: geo.size.height)
+                        .offset(x: terminalLeadingOffset)
+                    if store.rightSidebarMode != .hidden {
+                        Rectangle().fill(Theme.chromeSeparator)
+                            .frame(width: 1)
+                            .offset(x: geo.size.width - rightSidebarWidth - 1)
+                        AgentOverviewSidebar(store: store, mode: store.rightSidebarMode)
+                            .frame(width: rightSidebarWidth)
+                            .offset(x: geo.size.width - rightSidebarWidth)
+                    }
                 }
             }
         }
@@ -35,23 +49,41 @@ struct ContentView: View {
         .preferredColorScheme(Theme.chromeColorScheme)
         .ignoresSafeArea(.all)
         .onChange(of: store.sidebarMode) { _, _ in
-            onWindowLayoutChange(true)
+            onWindowLayoutChange(true, true)
         }
         .onChange(of: store.rightSidebarMode) { _, _ in
-            onWindowLayoutChange(true)
+            onWindowLayoutChange(true, true)
+        }
+        .onChange(of: store.isSidebarResizing) { _, active in
+            // Never expand the window during an interactive sidebar drag;
+            // updating `minSize` is enough and avoids a per-frame window jump.
+            if active { onWindowLayoutChange(false, false) }
         }
         .onChange(of: store.sidebarWidth) { _, _ in
-            onWindowLayoutChange(false)
+            onWindowLayoutChange(false, false)
+        }
+        .onChange(of: store.rightSidebarWidth) { _, _ in
+            onWindowLayoutChange(false, false)
         }
         .onChange(of: minimumTerminalTreeWidth) { _, _ in
             // Split/close/workspace-switch is discrete. Expand immediately:
             // unlike sidebar mode changes, split creation does not suspend
             // existing engines for an animation-wide SIGWINCH burst.
             // A smaller tree only relaxes the future resize limit.
-            onWindowLayoutChange(false)
+            onWindowLayoutChange(true, false)
+        }
+        .onChange(of: store.mainContent, initial: true) { _, content in
+            // The host stays mounted either way (see `mainPane`); hiding it
+            // stops it drawing under the board AND makes AppKit drop the
+            // terminal as first responder, so typing on the board can't
+            // land in a hidden shell. Coming back, hand focus to the active
+            // terminal again — nothing else re-runs that grab.
+            paneHost.isHidden = !content.showsTerminals
+            if content.showsTerminals {
+                paneHost.focusActiveTerminal()
+            }
         }
     }
-
     /// Top chrome strip. `window.isMovable = false` is set globally, so the
     /// `WindowDragHandle` background is the only place AppKit allows
     /// window dragging. The responsive `SearchTriggerPill` is scoped to the
@@ -87,6 +119,19 @@ struct ContentView: View {
                     }
                 }
             HStack(spacing: Theme.chromeControlSpacing) {
+                HoverableIconButton(
+                    systemName: "rectangle.split.3x1",
+                    fontSize: 12,
+                    size: Theme.chromeToolbarButtonSize,
+                    help: store.mainContent.showsKanban
+                        ? String(localized: "Back to Terminals", bundle: .kookyResources)
+                        : String(localized: "Kanban Board", bundle: .kookyResources)
+                ) {
+                    withAnimation(Theme.chromeTransition) {
+                        store.toggleKanban()
+                    }
+                }
+                .foregroundStyle(store.mainContent.showsKanban ? Theme.chromeForeground : Theme.chromeMuted)
                 OpenInButton(store: store)
                 HoverableIconButton(
                     systemName: "sidebar.right",
@@ -109,12 +154,39 @@ struct ContentView: View {
     }
 
     private var mainPane: some View {
-        // No `.id`, no conditional: the host view is permanent and handles
-        // "no workspace" itself. The old `.id(workspace.id)` teardown/rebuild
-        // per switch was the root of the mount-churn bug class (issues #8,
-        // #24, workspace-switch flicker) — the AppKit host switches by
-        // visibility instead.
-        PaneTreeHostRepresentable(host: paneHost)
+        // No `.id`, no conditional AROUND THE HOST: the host view is
+        // permanent and handles "no workspace" itself. The old
+        // `.id(workspace.id)` teardown/rebuild per switch was the root of
+        // the mount-churn bug class (issues #8, #24, workspace-switch
+        // flicker) — the AppKit host switches by visibility instead. The
+        // Kanban board is a sibling overlay for the same reason: it comes
+        // and goes, the host never does.
+        GeometryReader { proxy in
+            let split = store.mainContent == .kanbanSplit
+            let boardWidth = split ? Self.kanbanSplitWidth(for: proxy.size.width) : proxy.size.width
+            ZStack(alignment: .topLeading) {
+                // Split: the host is INSET, not re-parented — the same
+                // frame-only change a sidebar toggle makes.
+                PaneTreeHostRepresentable(host: paneHost)
+                    .padding(.leading, split ? boardWidth + 1 : 0)
+                if store.mainContent.showsKanban {
+                    HStack(spacing: 0) {
+                        KanbanBoardView(store: store)
+                            .frame(width: boardWidth)
+                        if split {
+                            Rectangle().fill(Theme.chromeSeparator).frame(width: 1)
+                        }
+                    }
+                    .transition(.opacity)
+                }
+            }
+        }
+    }
+
+    /// Board share of a split main area: enough for five scrolling columns,
+    /// never so much that the terminal beside it turns into a sliver.
+    static func kanbanSplitWidth(for total: CGFloat) -> CGFloat {
+        min(max(total * 0.45, 420), max(420, total - 520))
     }
 
     private var chromeBackground: Color {
@@ -124,6 +196,40 @@ struct ContentView: View {
 
     private var minimumTerminalTreeWidth: CGFloat {
         KookyWindowLayout.minimumTerminalTreeWidth(for: store.active?.root)
+    }
+
+    /// Rendered width of the left sidebar under the current mode — compact
+    /// and hidden are fixed, full follows the store's draggable width.
+    /// Mirrors `SidebarView`'s own `frame(width:)` so the terminal's leading
+    /// offset can never disagree with the sidebar's rendered edge.
+    private var sidebarWidth: CGFloat {
+        switch store.sidebarMode {
+        case .full: return store.sidebarWidth
+        case .compact: return SidebarView.compactWidth
+        case .hidden: return 0
+        }
+    }
+
+    private var rightSidebarWidth: CGFloat {
+        switch store.rightSidebarMode {
+        case .full: return store.rightSidebarWidth
+        case .compact: return AgentOverviewSidebar.compactWidth
+        case .hidden: return 0
+        }
+    }
+
+    private var terminalLeadingOffset: CGFloat {
+        sidebarWidth + (store.sidebarMode == .hidden ? 0 : 1)
+    }
+
+    /// Terminal width for the given content width. The drag gesture uses a
+    /// global coordinate space, so the sidebar edge is stable while this
+    /// value follows the live width on every frame. Engine size propagation
+    /// remains suspended until drag end to avoid SIGWINCH storms.
+    private func terminalWidth(in total: CGFloat) -> CGFloat {
+        let separators = (store.sidebarMode == .hidden ? 0 : 1)
+            + (store.rightSidebarMode == .hidden ? 0 : 1)
+        return max(0, total - sidebarWidth - rightSidebarWidth - CGFloat(separators))
     }
 
     private var sidebarTooltip: String {

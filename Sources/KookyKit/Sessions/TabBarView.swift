@@ -9,10 +9,19 @@ struct TabBarView: View {
     let store: WorkspaceStore
 
     @State private var isAddMenuOpen = false
+    /// Frames (in `Self.coordinateSpace`) of everything that handles its own
+    /// clicks — tab rows, `+`, the split buttons. The double-click-to-zoom
+    /// handler skips these so two quick clicks on a tab don't zoom the
+    /// window on top of activating it.
+    @State private var interactiveFrames: [String: CGRect] = [:]
+
+    private static let coordinateSpace = "tabBar"
+    private static let addButtonKey = "add"
+    private static let splitButtonsKey = "split"
 
     var body: some View {
         HStack(spacing: 0) {
-            ScrollView(.horizontal, showsIndicators: false) {
+            ScrollView(.horizontal) {
                 HStack(spacing: Theme.space1) {
                     ForEach(Array(pane.tabs.enumerated()), id: \.element.id) { index, tab in
                         DraggableTabRow(
@@ -23,25 +32,34 @@ struct TabBarView: View {
                             myIndex: index,
                             canCloseToRight: index < pane.tabs.count - 1
                         )
+                        .reportingFrame(key: tab.id.uuidString, in: Self.coordinateSpace, into: $interactiveFrames)
                     }
                     addButton
+                        .reportingFrame(key: Self.addButtonKey, in: Self.coordinateSpace, into: $interactiveFrames)
                 }
                 .padding(.horizontal, 10)
             }
-            // Double-click on tab bar empty area triggers macOS Zoom (filled
-            // screen, dock/menu kept) — same gesture as the system title-bar
-            // double-click. SwiftUI arbitrates count: 2 alongside children's
-            // count: 1 taps so tab activation still fires on single click.
-            .contentShape(Rectangle())
-            .onTapGesture(count: 2) {
-                NSApplication.shared.keyWindow?.performZoom(nil)
-            }
+            .scrollIndicators(.hidden)
 
             // Split controls pinned to the trailing edge — outside the
             // ScrollView so they stay put while the tabs scroll.
             splitButtons
+                .reportingFrame(key: Self.splitButtonsKey, in: Self.coordinateSpace, into: $interactiveFrames)
         }
         .frame(height: Theme.contentHeaderHeight)
+        .coordinateSpace(name: Self.coordinateSpace)
+        .background {
+            TabBarDoubleClickHandler(exclusions: currentInteractiveFrames) {
+                NSApplication.shared.keyWindow?.performZoom(nil)
+            }
+        }
+    }
+
+    /// Only the frames of tabs that still exist — a closed tab's last frame
+    /// must not keep blocking the empty space it used to cover.
+    private var currentInteractiveFrames: [CGRect] {
+        let liveKeys = Set(pane.tabs.map(\.id.uuidString) + [Self.addButtonKey, Self.splitButtonsKey])
+        return interactiveFrames.compactMap { liveKeys.contains($0.key) ? $0.value : nil }
     }
 
     /// Split-right / split-down buttons. Mirror ⌘D / ⌘⇧D exactly: Split
@@ -77,6 +95,100 @@ struct TabBarView: View {
             store: store,
             isMenuOpen: $isAddMenuOpen
         )
+    }
+}
+
+private extension View {
+    /// Publishes this view's frame in the named coordinate space into
+    /// `frames[key]`, kept current across layout and scrolling.
+    func reportingFrame(key: String, in space: String, into frames: Binding<[String: CGRect]>) -> some View {
+        onGeometryChange(for: CGRect.self) { proxy in
+            proxy.frame(in: .named(space))
+        } action: { frame in
+            frames.wrappedValue[key] = frame
+        }
+    }
+}
+
+/// Double-clicking the tab bar's empty space triggers macOS Zoom (filled
+/// screen, dock and menu kept) — the same behavior as double-clicking the
+/// system title bar. Capture it at the AppKit event boundary: a gesture
+/// recognizer attached to SwiftUI's background host is not guaranteed to
+/// sit on the event-hit view, so it can silently miss clicks; and a SwiftUI
+/// `count: 2` tap on the bar would delay the tabs' single clicks.
+/// `exclusions` are the tab rows and buttons (in the bar's own top-left
+/// coordinate space) — clicks there belong to those controls.
+private struct TabBarDoubleClickHandler: NSViewRepresentable {
+    let exclusions: [CGRect]
+    let action: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(action: action) }
+
+    func makeNSView(context: Context) -> AnchorView {
+        AnchorView(coordinator: context.coordinator)
+    }
+
+    func updateNSView(_ nsView: AnchorView, context: Context) {
+        context.coordinator.action = action
+        context.coordinator.exclusions = exclusions
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        var action: () -> Void
+        var exclusions: [CGRect] = []
+
+        init(action: @escaping () -> Void) {
+            self.action = action
+        }
+    }
+
+    @MainActor
+    final class AnchorView: NSView {
+        private let coordinator: Coordinator
+        private var monitor: Any?
+
+        init(coordinator: Coordinator) {
+            self.coordinator = coordinator
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+        /// Top-left origin, so a converted event point lives in the same
+        /// space as the SwiftUI frames in `coordinator.exclusions`.
+        override var isFlipped: Bool { true }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            removeMonitor()
+            guard window != nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
+                guard let self,
+                      event.clickCount == 2,
+                      event.window === self.window
+                else { return event }
+                let point = convert(event.locationInWindow, from: nil)
+                guard bounds.contains(point),
+                      !coordinator.exclusions.contains(where: { $0.contains(point) })
+                else { return event }
+                coordinator.action()
+                return event
+            }
+        }
+
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            if newWindow == nil { removeMonitor() }
+            super.viewWillMove(toWindow: newWindow)
+        }
+
+        private func removeMonitor() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
     }
 }
 

@@ -177,10 +177,56 @@ enum OpenInResolver {
         installedApps(model: model).filter { !model.hiddenOpenInApps.contains($0.id) }
     }
 
-    /// Open `directory` in `app`. Editors open the folder as a project,
-    /// terminals open a new session there, Finder opens the folder window.
+    /// Open `directory` in `app`. Editors open the folder as a project —
+    /// or the project's workspace file when the folder carries one (see
+    /// `projectTarget`) — terminals open a new session there, Finder opens
+    /// the folder window.
     static func open(directory: URL, with app: OpenInApp) {
-        _ = open(url: directory, with: app)
+        _ = open(url: projectTarget(for: directory, app: app), with: app)
+    }
+
+    /// Apps that understand VS Code's `.code-workspace` files: VS Code and
+    /// every fork that kept its workspace format.
+    nonisolated static let codeWorkspaceAppIds: Set<String> = ["vscode", "cursor", "windsurf", "antigravity", "trae", "kiro"]
+
+    /// What `app` should actually open for `directory`: a workspace file
+    /// sitting at the folder's top level beats the bare folder, because the
+    /// workspace is where multi-root layouts, per-workspace settings and
+    /// launch configs live — opening the folder silently drops all of that.
+    ///
+    /// - VS Code family: `<dir>/*.code-workspace`
+    /// - Xcode: `<dir>/*.xcworkspace`, else `<dir>/*.xcodeproj`
+    ///
+    /// Several candidates: one named after the folder wins, else the
+    /// alphabetically first (stable, and what Finder shows on top). Anything
+    /// else — no match, other apps, an unreadable dir — falls back to the
+    /// directory itself.
+    nonisolated static func projectTarget(for directory: URL, app: OpenInApp, fileManager: FileManager = .default) -> URL {
+        let extensions: [String]
+        if codeWorkspaceAppIds.contains(app.id) {
+            extensions = ["code-workspace"]
+        } else if app.id == "xcode" {
+            extensions = ["xcworkspace", "xcodeproj"]
+        } else {
+            return directory
+        }
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return directory }
+        let folderName = directory.lastPathComponent
+        for ext in extensions {
+            let candidates = entries
+                .filter { $0.pathExtension == ext }
+                .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+            guard !candidates.isEmpty else { continue }
+            if let named = candidates.first(where: { $0.deletingPathExtension().lastPathComponent == folderName }) {
+                return named
+            }
+            return candidates[0]
+        }
+        return directory
     }
 
     /// Open one file / folder / URL with a chosen application. Returns false

@@ -87,6 +87,7 @@ enum KookyWindowLayout {
         leftMode: SidebarMode,
         expandedLeftWidth: CGFloat,
         rightMode: SidebarMode,
+        expandedRightWidth: CGFloat,
         terminalWidth: CGFloat = minimumTerminalWidth
     ) -> CGFloat {
         let leftWidth: CGFloat
@@ -98,7 +99,7 @@ enum KookyWindowLayout {
 
         let rightWidth: CGFloat
         switch rightMode {
-        case .full: rightWidth = AgentOverviewSidebar.fullWidth
+        case .full: rightWidth = AgentOverviewSidebar.clampWidth(expandedRightWidth)
         case .compact: rightWidth = AgentOverviewSidebar.compactWidth
         case .hidden: rightWidth = 0
         }
@@ -171,6 +172,17 @@ final class KookyWindowController: NSWindowController, NSWindowDelegate {
     /// Settings / Update panel is the key window instead.
     var onDidBecomeKey: ((KookyWindowController) -> Void)?
 
+    /// The frame kooky persists for this window: the live frame, or — while
+    /// in native fullscreen, transitions included — the frame it had before
+    /// entering, so a ⌘Q from fullscreen doesn't restore a screen-sized
+    /// normal window. Read through `WindowPersistence.frameProvider` on every
+    /// state save; nil once the window is gone (the saved value is kept).
+    var persistableFrame: PersistedFrame? {
+        guard let window else { return nil }
+        return PersistedFrame(preFullScreenFrame ?? window.frame)
+    }
+    private var preFullScreenFrame: NSRect?
+
     init(windowId: UUID, store: WorkspaceStore) {
         self.windowId = windowId
         self.store = store
@@ -178,8 +190,8 @@ final class KookyWindowController: NSWindowController, NSWindowDelegate {
         super.init(window: Self.makeWindow())
         window?.delegate = self
         window?.contentView = NSHostingView(
-            rootView: ContentView(store: store, paneHost: paneHost) { [weak self] animateExpansion in
-                self?.updateMinimumWindowSize(expandIfNeeded: true, animate: animateExpansion)
+            rootView: ContentView(store: store, paneHost: paneHost) { [weak self] expandIfNeeded, animate in
+                self?.updateMinimumWindowSize(expandIfNeeded: expandIfNeeded, animate: animate)
             }
         )
         alignTrafficLights()
@@ -242,10 +254,40 @@ final class KookyWindowController: NSWindowController, NSWindowDelegate {
 
     func windowDidResize(_ notification: Notification) {
         alignTrafficLights()
+        noteFrameChanged()
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        noteFrameChanged()
+    }
+
+    func windowWillEnterFullScreen(_ notification: Notification) {
+        preFullScreenFrame = window?.frame
     }
 
     func windowDidExitFullScreen(_ notification: Notification) {
+        preFullScreenFrame = nil
         alignTrafficLights()
+        // The exit transition's own resize / move notifications arrived while
+        // the frame was pinned and were skipped — save once now.
+        noteFrameChanged()
+    }
+
+    /// An interrupted enter (animation cancelled, gesture conflict) leaves a
+    /// normal window with no `didExit` coming — unpin here or every later
+    /// move / resize would be ignored and the stale frame saved forever.
+    func windowDidFailToEnterFullScreen(_ window: NSWindow) {
+        preFullScreenFrame = nil
+        noteFrameChanged()
+    }
+
+    /// Per-frame during drags and live resizes; the store's 1s debounce
+    /// coalesces those into one write. While fullscreen the persisted frame
+    /// is pinned to `preFullScreenFrame`, so a save would only rewrite
+    /// state.json with what's already on disk.
+    private func noteFrameChanged() {
+        guard preFullScreenFrame == nil else { return }
+        store.scheduleSave()
     }
 
     func windowWillResize(_ sender: NSWindow, to frameSize: NSSize) -> NSSize {
@@ -260,6 +302,7 @@ final class KookyWindowController: NSWindowController, NSWindowDelegate {
             leftMode: store.sidebarMode,
             expandedLeftWidth: store.sidebarWidth,
             rightMode: store.rightSidebarMode,
+            expandedRightWidth: store.rightSidebarWidth,
             terminalWidth: KookyWindowLayout.minimumTerminalTreeWidth(for: store.active?.root)
         )
     }
@@ -297,7 +340,7 @@ final class KookyWindowController: NSWindowController, NSWindowDelegate {
     /// so mirror the current layout policy here. If the required width grows,
     /// expand up to the current screen's visible width; beyond that physical
     /// limit, the balanced split fractions let every pane shrink together.
-    private func updateMinimumWindowSize(expandIfNeeded: Bool, animate: Bool) {
+    func updateMinimumWindowSize(expandIfNeeded: Bool, animate: Bool) {
         guard let window else { return }
         let screen = window.screen ?? NSScreen.main
         let width = minimumWindowWidth(on: screen)
@@ -310,5 +353,57 @@ final class KookyWindowController: NSWindowController, NSWindowDelegate {
             target = window.constrainFrameRect(target, to: screen)
         }
         window.setFrame(target, display: true, animate: animate)
+    }
+
+}
+
+extension PersistedFrame {
+    init(_ rect: NSRect) {
+        self.init(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height)
+    }
+
+    var rect: NSRect { NSRect(x: x, y: y, width: width, height: height) }
+}
+
+/// Where a window with a saved frame goes on the CURRENT screen layout.
+/// Pure so the display-gone / half-offscreen / oversize cases are unit-tested.
+enum WindowPlacement {
+    /// `screens` are visible frames (menu bar and Dock excluded), main screen
+    /// first. The saved frame is kept where it overlaps a screen the most,
+    /// pulled fully inside it and clamped to its size (a monitor that shrank)
+    /// and to `minSize` (the window's layout minimum grew since). A frame
+    /// that overlaps no screen — the display it lived on is gone — keeps its
+    /// size and lands centered on the main screen. nil only for garbage
+    /// (non-finite / non-positive) or no screens at all.
+    static func restoredFrame(_ saved: NSRect, minSize: NSSize, screens: [NSRect]) -> NSRect? {
+        guard saved.origin.x.isFinite, saved.origin.y.isFinite,
+              saved.width.isFinite, saved.height.isFinite,
+              saved.width > 0, saved.height > 0,
+              let main = screens.first
+        else { return nil }
+        let overlap = { (screen: NSRect) -> CGFloat in
+            let i = screen.intersection(saved)
+            return i.isNull ? 0 : i.width * i.height
+        }
+        if let screen = screens.max(by: { overlap($0) < overlap($1) }), overlap(screen) > 0 {
+            return fit(saved, in: screen, minSize: minSize)
+        }
+        // Display gone: settle the size first (same clamps as above), then
+        // center THAT — centering the saved size and growing afterwards
+        // would push the window off-center by half the growth.
+        let sized = fit(saved, in: main, minSize: minSize).size
+        return NSRect(
+            x: main.midX - sized.width / 2, y: main.midY - sized.height / 2,
+            width: sized.width, height: sized.height
+        )
+    }
+
+    private static func fit(_ frame: NSRect, in screen: NSRect, minSize: NSSize) -> NSRect {
+        var f = frame
+        f.size.width = min(max(f.width, minSize.width), screen.width)
+        f.size.height = min(max(f.height, minSize.height), screen.height)
+        f.origin.x = min(max(f.minX, screen.minX), screen.maxX - f.width)
+        f.origin.y = min(max(f.minY, screen.minY), screen.maxY - f.height)
+        return f
     }
 }

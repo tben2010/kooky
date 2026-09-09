@@ -1334,6 +1334,29 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(makeStore(initial: legacy).sidebarWidth, SidebarView.fullWidth)
     }
 
+    func testRightSidebarWidthPersistsAndRestoresClamped() throws {
+        let persistence = InMemoryPersistence()
+        let store = WorkspaceStore(persistence: persistence, engineFactory: { TestEngine() })
+        store.addWorkspace(workingDirectory: projectA)
+        store.rightSidebarWidth = 320
+        store.flushPersistence()
+        XCTAssertEqual(persistence.saved?.rightSidebarWidth, 320)
+
+        let restored = makeStore(initial: persistence.saved)
+        XCTAssertEqual(restored.rightSidebarWidth, 320)
+
+        // A hand-edited / stale width restores clamped to the floor — the
+        // design width is the minimum, the panel only grows.
+        var narrow = persistence.saved!
+        narrow.rightSidebarWidth = 80
+        XCTAssertEqual(makeStore(initial: narrow).rightSidebarWidth, AgentOverviewSidebar.fullWidth)
+
+        // Pre-resizable-panel state files (no key) restore the default.
+        var legacy = persistence.saved!
+        legacy.rightSidebarWidth = nil
+        XCTAssertEqual(makeStore(initial: legacy).rightSidebarWidth, AgentOverviewSidebar.fullWidth)
+    }
+
     func testRequestRenameActiveWorkspaceLeavesFilesMode() {
         // The rename popover anchors to a workspace row — ⌘⇧R from files
         // mode must flip the sidebar back so the parked request is consumed.
@@ -1584,6 +1607,42 @@ final class WorkspaceStoreTests: XCTestCase {
             .flatMap(\.root.allTabs)
             .first { $0.id == tab.id }
         XCTAssertEqual(persistedTab?.conversationId, "convo-roundtrip")
+    }
+
+    /// ⌘Q's teardown echo (#70): `terminate()` SIGHUPs the agent, its
+    /// shutdown hook reports mid-drain, and the final flush must still
+    /// persist the agent and its conversation, not a plain terminal.
+    func testHookTrafficAfterTerminateCannotChangeWhatRestores() throws {
+        let persistence = InMemoryPersistence()
+        let store = makeStore(persistence: persistence)
+        let ws = store.addWorkspace(workingDirectory: projectA)
+        let tab = store.addTab(in: ws, template: .terminal)
+        store.applyHookEvent(agent: .ohMyPi, event: .running, sessionId: tab.id)
+        store.applyConversationId(conversationId: "omp-session", sessionId: tab.id)
+
+        store.terminate()
+        store.applyHookEvent(agent: .ohMyPi, event: .ended, sessionId: tab.id)
+        store.applyConversationId(conversationId: "late-id", sessionId: tab.id)
+        store.flushPersistence()
+
+        let persisted = try XCTUnwrap(
+            persistence.saved?.workspaces.flatMap(\.root.allTabs).first { $0.id == tab.id }
+        )
+        XCTAssertEqual(persisted.agentId, AgentTemplate.ohMyPi.id)
+        XCTAssertEqual(persisted.conversationId, "omp-session")
+    }
+
+    /// Scope check: a live store still reverts on `ended`, keeping only the id.
+    func testEndedBeforeTerminateStillRevertsToTerminal() {
+        let store = makeStore()
+        let ws = store.addWorkspace(workingDirectory: projectA)
+        let tab = store.addTab(in: ws, template: .terminal)
+        store.applyHookEvent(agent: .ohMyPi, event: .running, sessionId: tab.id)
+        store.applyConversationId(conversationId: "omp-session", sessionId: tab.id)
+        store.applyHookEvent(agent: .ohMyPi, event: .ended, sessionId: tab.id)
+
+        XCTAssertEqual(tab.agent.id, AgentTemplate.terminal.id)
+        XCTAssertEqual(tab.conversationId, "omp-session")
     }
 
     func testClaudeNoSessionPersistenceDropsResumeIdWithoutDisablingFutureCapture() {

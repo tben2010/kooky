@@ -128,6 +128,9 @@ final class KookyCLIController {
     /// presets. One roster serves both the lookup and the error hint, so
     /// the ids an error lists are exactly the ids the lookup accepts.
     private let templates: @MainActor () -> [AgentTemplate]
+    /// The Kanban board `card` verbs act on. Injected so tests drive an
+    /// isolated store; production resolves the shared one lazily.
+    private let board: @MainActor () -> KanbanStore
     private let resume: @MainActor (
         _ agentId: String,
         _ conversationId: String,
@@ -143,6 +146,7 @@ final class KookyCLIController {
         activateApp: @escaping @MainActor () -> Void,
         isShuttingDown: @escaping @MainActor () -> Bool = { false },
         templates: @escaping @MainActor () -> [AgentTemplate],
+        board: @escaping @MainActor () -> KanbanStore = { .shared },
         resume: @escaping @MainActor (
             _ agentId: String,
             _ conversationId: String,
@@ -157,6 +161,7 @@ final class KookyCLIController {
         self.activateApp = activateApp
         self.isShuttingDown = isShuttingDown
         self.templates = templates
+        self.board = board
         self.resume = resume
     }
 
@@ -194,7 +199,211 @@ final class KookyCLIController {
             handleOpen(request, isCallerWaiting: isCallerWaiting, completion: completion)
         case .resume:
             handleResume(request, isCallerWaiting: isCallerWaiting, completion: completion)
+        case .card:
+            handleCard(request, completion: completion)
         }
+    }
+
+    // MARK: - Kanban card
+
+    /// `card --done | --note | --show`. The card comes from `--id`, or —
+    /// the shape the launch prompt relies on — from the invoking tab
+    /// (`surface`), matched against the card that launched that session.
+    private func handleCard(_ request: KookyCLIRequest, completion: @escaping @MainActor (KookyCLIResponse) -> Void) {
+        let board = board()
+        if request.cardAction == "new" {
+            return handleNewCard(request, board: board, completion: completion)
+        }
+        let card: KanbanCard
+        if let raw = request.cardId {
+            guard let id = UUID(uuidString: raw) else {
+                return completion(refuse("--id expects a card UUID"))
+            }
+            if let found = board.card(id: id) {
+                card = found
+            } else if let archivedCard = board.archivedCard(id: id) {
+                // An archived card is still a fact an agent may ask about,
+                // but not something to move or annotate from a shell.
+                guard request.cardAction == "show" else {
+                    return completion(refuse("card \"\(archivedCard.title)\" is archived — restore it from the board's archive first"))
+                }
+                return completion(ok(note: Self.renderCard(archivedCard, archived: true)))
+            } else {
+                return completion(refuse("no card with id \(id.uuidString)"))
+            }
+        } else if let raw = request.surface, let surface = UUID(uuidString: raw) {
+            guard let found = board.card(launchedSession: surface) else {
+                return completion(refuse("this tab was not launched from a Kanban card — pass --id <card-uuid>"))
+            }
+            card = found
+        } else {
+            return completion(refuse("card needs --id <card-uuid> (or run it inside the card's agent tab)"))
+        }
+        if request.cardAction == "start" {
+            // Same path as dragging the card to In Progress: move, then
+            // launch into the key window (or the fallback window).
+            guard let context = windows().first(where: \.isKey) ?? windows().first ?? fallbackWindow()?.context else {
+                return completion(refuse("kooky has no window to launch into"))
+            }
+            let outcome = board.move(card.id, to: .inProgress)
+            // In Progress with no live tab (kooky was restarted, or the tab
+            // was closed): a relaunch is what the caller means.
+            let deadInProgress: Bool = {
+                guard case .moved = outcome, card.column == .inProgress else { return false }
+                return card.launchedSessionId.flatMap(locate) == nil
+            }()
+            switch outcome {
+            case .rejected(let reasons):
+                return completion(refuse("card is not ready: \(reasons.joined(separator: ", "))"))
+            case .moved where !deadInProgress:
+                return completion(ok(note: "card \"\(card.title)\" is already running — nothing launched"))
+            case .moved, .needsLaunch:
+                Task { @MainActor [weak self] in
+                    let failure = await KanbanLaunchCoordinator.launch(cardId: card.id, board: board, store: context.store)
+                    // The launch is board state the user sees, not a throwaway
+                    // `-e` — so no request deadline here. Shutdown still wins:
+                    // the ⌘Q drain has flushed the board, and a tab spawned
+                    // into a store that is being torn down must not report
+                    // success.
+                    guard let self, !self.isShuttingDown() else {
+                        completion(.failure("kooky is shutting down"))
+                        return
+                    }
+                    if let failure {
+                        completion(self.refuse("launch failed: \(failure)"))
+                    } else {
+                        let launched = board.card(id: card.id)
+                        completion(self.ok(
+                            tabId: launched?.launchedSessionId?.uuidString,
+                            note: "launched \(launched?.agentId ?? card.agentId) for \"\(card.title)\" on \(launched?.branchName ?? card.branchName)"
+                        ))
+                    }
+                }
+                return
+            }
+        }
+        completion(handleCardSync(request, card: card, board: board))
+    }
+
+    /// `card --new`: a Backlog card for the repo around `cwd`. The git root
+    /// and (when `--branch` is absent) the checked-out branch come from a
+    /// subprocess, so both resolve off the main actor — same reason `open`
+    /// stats its cwd there. Nothing is launched; the note carries the id
+    /// so a script can follow up with `card --start --id`.
+    private func handleNewCard(_ request: KookyCLIRequest, board: KanbanStore, completion: @escaping @MainActor (KookyCLIResponse) -> Void) {
+        guard let title = request.title.flatMap(normalizedTitle) else {
+            return completion(refuse("--title needs text"))
+        }
+        guard let cwd = request.cwd, !cwd.isEmpty else {
+            return completion(refuse("card --new needs --cwd <dir> (a directory inside the project's git repository)"))
+        }
+        guard cwd.hasPrefix("/") else {
+            return completion(refuse("cwd must be an absolute path"))
+        }
+        let agentId = request.agent ?? AgentTemplate.claudeCodeID
+        guard let template = lookupTemplate(agentId) else {
+            let known = templates().map(\.id).joined(separator: ", ")
+            return completion(refuse("unknown agent template '\(agentId)' — known templates: \(known)"))
+        }
+        let requirement = request.requirement?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let criteria = request.criteria.map(KanbanCard.criteria(fromLines:)) ?? []
+        let requestedBranch = request.branch?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cwdURL = URL(fileURLWithPath: cwd)
+        // Same gates as `open`: the stat + git probe is bounded by a race
+        // (a dead mount never returns), and nothing is created once the
+        // request is stale or the app is on its way out — `board.add` after
+        // the ⌘Q flush would be a card that exists for one second.
+        let deadline = RequestDeadline(Self.asyncVerbDeadline)
+        Task { @MainActor [weak self] in
+            let probe: (root: URL, branch: String)?? = await withOffMainTimeout(Self.directoryProbeBudget) {
+                var isDirectory: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: cwdURL.path, isDirectory: &isDirectory), isDirectory.boolValue,
+                      let root = WorktreeManager.repoRoot(near: cwdURL)
+                else { return nil }
+                if let requestedBranch, !requestedBranch.isEmpty { return (root, requestedBranch) }
+                return (root, KanbanRepoInfo.load(projectRoot: root).defaultBranch)
+            }
+            guard let self, !self.isShuttingDown() else {
+                completion(.failure("kooky is shutting down"))
+                return
+            }
+            guard let resolution = probe else {
+                completion(.failure("checking \(cwd) timed out — is it on an unreachable network volume?"))
+                return
+            }
+            guard let resolved = resolution else {
+                completion(self.refuse("\(cwd) is not inside a git repository — cards belong to a repo"))
+                return
+            }
+            guard !deadline.hasExpired else {
+                completion(.failure("kooky took too long to answer; no card was created"))
+                return
+            }
+            let card = KanbanCard(
+                title: title,
+                requirement: requirement,
+                acceptanceCriteria: criteria,
+                projectRoot: resolved.root,
+                agentId: template.id,
+                branchName: resolved.branch
+            )
+            board.add(card)
+            completion(self.ok(note: "created card \(card.id.uuidString) — \"\(card.title)\" in Backlog of \(resolved.root.path) on \(card.branchName)"))
+        }
+    }
+
+    private func handleCardSync(_ request: KookyCLIRequest, card: KanbanCard, board: KanbanStore) -> KookyCLIResponse {
+        // Capture the agent's conversation id while its tab is still alive —
+        // a later relaunch resumes it instead of starting over.
+        if let sessionId = card.launchedSessionId,
+           let hit = locate(sessionId),
+           let conversationId = hit.session.conversationId {
+            board.recordConversationId(conversationId, forSession: sessionId)
+        }
+        switch request.cardAction {
+        case "done":
+            guard card.column == .inProgress else {
+                return ok(note: "card \"\(card.title)\" is in \(card.column.rawValue), not In Progress — nothing moved")
+            }
+            board.move(card.id, to: .inReview)
+            return ok(note: "card \"\(card.title)\" moved to In Review")
+        case "note":
+            guard let text = request.note?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+                return refuse("--note needs text")
+            }
+            board.appendNote(id: card.id, text: text)
+            return ok(note: "noted on \"\(card.title)\"")
+        case "show":
+            return ok(note: Self.renderCard(card))
+        default:
+            return refuse("card needs one of --start, --done, --note <text>, --show")
+        }
+    }
+
+    /// Plain-text card summary for `card --show` — what an agent reads
+    /// back to re-orient itself.
+    static func renderCard(_ card: KanbanCard, archived: Bool = false) -> String {
+        var lines: [String] = []
+        lines.append("card \(card.id.uuidString)")
+        lines.append("title: \(card.title)")
+        lines.append("column: \(card.column.rawValue)")
+        if archived { lines.append("archived: yes") }
+        lines.append("branch: \(card.branchName)")
+        if let worktree = card.worktreePath { lines.append("worktree: \(worktree.path)") }
+        lines.append("agent: \(card.agentId)\(card.model.map { " (\($0))" } ?? "")")
+        lines.append("")
+        lines.append("requirement:")
+        lines.append(card.requirement)
+        lines.append("")
+        lines.append("acceptance criteria:")
+        for criterion in card.effectiveCriteria { lines.append("- [ ] \(criterion)") }
+        let notes = card.events.filter { $0.message.hasPrefix("note: ") }
+        if !notes.isEmpty {
+            lines.append("")
+            lines.append("notes:")
+            for note in notes.suffix(10) { lines.append("- \(note.message.dropFirst("note: ".count))") }
+        }
+        return lines.joined(separator: "\n")
     }
 
     // MARK: - Verbs

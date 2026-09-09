@@ -20,7 +20,7 @@ A minimal modern terminal built for AI coding. Sidebar workspaces; horizontal / 
 
 ## Features
 
-**Vertical tabs, split panes & windows.** Sidebar workspaces with three-state collapse (`⌘⌃S`); drag the sidebar's right edge to widen it, and the width sticks per window. Each pane owns its own tab strip and active tab; split it right or down from the two buttons on its tab bar, or with ⌘D / ⌘⇧D. Rename a tab with ⌘R, a workspace with ⌘⇧R. `⌘⇧N` opens another window. Drag a tab to reorder it, move it across panes, or drop it into a different window — the live session moves whole, scrollback and running process intact. State persists across launches; every open window is restored. Open any folder as a new workspace: drop it onto the sidebar from Finder, or use ⌘O. Press `⌘⇧E` to zoom the active pane to fullscreen and back — the other panes slide off-screen but their processes keep running.
+**Vertical tabs, split panes & windows.** Sidebar workspaces with three-state collapse (`⌘⌃S`); drag the sidebar's right edge to widen it, and the width sticks per window. Each pane owns its own tab strip and active tab; split it right or down from the two buttons on its tab bar, or with ⌘D / ⌘⇧D. Rename a tab with ⌘R, a workspace with ⌘⇧R. `⌘⇧N` opens another window. Drag a tab to reorder it, move it across panes, or drop it into a different window — the live session moves whole, scrollback and running process intact. State persists across launches; every open window is restored, at the size and position you left it. Open any folder as a new workspace: drop it onto the sidebar from Finder, or use ⌘O. Press `⌘⇧E` to zoom the active pane to fullscreen and back — the other panes slide off-screen but their processes keep running.
 
 ![Vertical tabs on the left, one pane split into four](img/screenshot-2.png)
 
@@ -41,8 +41,8 @@ A minimal modern terminal built for AI coding. Sidebar workspaces; horizontal / 
 | Antigravity CLI | `agy` | ✓ | ✗ | ✗ |
 | Kimi Code | `kimi` | ✓ | ✗ | ✓ |
 | Pi | `pi` | ✓ | ✓ | ✓ |
-| Oh My Pi (new) | `omp` | ✓ | ✓ | ✓ |
-| Reasonix (new) | `reasonix` | ✓ | ✓ | ✓ |
+| Oh My Pi | `omp` | ✓ | ✓ | ✓ |
+| Reasonix | `reasonix` | ✓ | ✓ | ✓ |
 | Kiro CLI | `kiro-cli` | ✗ | ✗ | ✓ |
 | Droid | `droid` | ✓ | ✗ | ✓ |
 
@@ -82,7 +82,7 @@ A minimal modern terminal built for AI coding. Sidebar workspaces; horizontal / 
 
 **Agent panel.** A right-side sidebar — toggle in the top bar, three collapse states like the left one — lists every agent across all your windows at once, sorted by who needs you first: waiting on you, then failed, then running, then idle. Click any row to jump straight to that tab; compact mode shrinks it to a rail of status-tinted icons.
 
-**Session history.** Flip the agent panel to its second page — the clock at the bottom — to browse past conversations from most of the built-in agents (see the table above), newest first, including ones started outside kooky. Search by title or project, filter by agent, and click a row to pick that conversation back up: a new tab opens in the conversation's own folder and resumes it with the agent's exact session ID.
+**Session history.** Flip the agent panel to its second page — the clock at the bottom — to browse past conversations from most of the built-in agents (see the table above), newest first, including ones started outside kooky. Search by title or project, filter by agent or narrow to the current workspace (local workspaces only — an SSH workspace's sessions live on the remote), and click a row to pick that conversation back up: a new tab opens in the conversation's own folder and resumes it with the agent's exact session ID.
 
 ![Search and resume any past Claude Code or Codex conversation](img/screenshot-5.webp)
 
@@ -182,7 +182,7 @@ Requires Xcode 26+ and macOS 14+ (Sonoma — `@Observable` is the floor).
 ./scripts/setup-libghostty.sh        # one-time: fetch the libghostty xcframework
 swift build
 swift run                            # dev mode
-swift test                           # 850+ unit tests
+swift test                           # 1000+ unit tests
 ./scripts/bench.sh                   # performance benchmarks (release build, results in bench-history.jsonl)
 
 ./scripts/build-app.sh               # writes dist/Kooky.app

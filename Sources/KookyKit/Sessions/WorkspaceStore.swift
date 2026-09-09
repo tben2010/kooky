@@ -37,6 +37,22 @@ func canonicalDiskPath(_ url: URL) -> URL {
     url.resolvingSymlinksInPath().standardizedFileURL
 }
 
+/// "`path` is `root` or lies inside it", on already-standardized absolute
+/// paths. The sibling trap (`/a/bc` is not inside `/a/b`) lives here once;
+/// so does the root-of-the-disk case, which the prefix form alone would
+/// spell as `//`.
+func pathIsInside(_ path: String, root: String) -> Bool {
+    root == "/" ? path.hasPrefix("/") : path == root || path.hasPrefix(root + "/")
+}
+
+/// macOS keeps `/tmp`, `/var`, `/etc` as symlinks into `/private`. Foundation
+/// strips that prefix when it resolves a path; the kernel's `getcwd` — what
+/// an agent records — keeps it. The other spelling of a path under those
+/// dirs, nil elsewhere.
+func privateSpelling(of path: String) -> String? {
+    ["/tmp", "/var", "/etc"].contains { pathIsInside(path, root: $0) } ? "/private" + path : nil
+}
+
 /// Trims a title string; blank or whitespace-only input collapses to `nil`.
 /// Shared by the manual-rename paths and the OSC-title observer so "empty
 /// means no title" stays one rule.
@@ -97,6 +113,22 @@ enum RightSidebarContent: String, Codable, Equatable, Sendable, CaseIterable {
     case info
 }
 
+/// What the window's main area shows — the terminal pane tree or the
+/// Kanban board. The pane-tree host stays mounted in both cases (see
+/// `ContentView.mainPane`); `.kanban` only overlays the board and hides
+/// the host, so every running session keeps its PTY.
+enum MainContent: String, Codable, Equatable, Sendable {
+    case terminals
+    /// Board covers the whole main area; the host is hidden.
+    case kanban
+    /// Board on the left, the live pane tree on the right — the host stays
+    /// visible (inset), so an In Progress card's agent tab can be watched.
+    case kanbanSplit
+
+    var showsKanban: Bool { self != .terminals }
+    var showsTerminals: Bool { self != .kanban }
+}
+
 @MainActor
 @Observable
 final class WorkspaceStore {
@@ -119,12 +151,74 @@ final class WorkspaceStore {
     /// session information.
     /// Persisted like `sidebarContent`; the panel's own footer toggle flips it.
     var rightSidebarContent: RightSidebarContent = .agents
+    /// Main-area content — terminals or the Kanban board. Per window,
+    /// persisted like `sidebarContent`; the board's cards themselves live in
+    /// the app-wide `KanbanStore`.
+    var mainContent: MainContent = .terminals
+    /// Which board layout ⌘⇧K comes back to — the split state is a
+    /// preference the user set inside the board, not something a plain
+    /// toggle should reset.
+    private var lastKanbanContent: MainContent = .kanban
     /// History pane's agent filter + search text. Runtime-only, but owned by
     /// the STORE, not the view: collapsing the panel (or cycling its mode)
     /// unmounts `SessionHistoryView`, and `@State` there would reset both to
     /// defaults on every reopen.
     var historyFilterAgentId: String?
     var historySearchQuery = ""
+    /// The "only this workspace" checkbox: list only sessions that ran
+    /// inside the active workspace (`historyWorkspaceRoot`). Off by default
+    /// like the agent chip — it isn't persisted, and a preference that
+    /// reset to ON would need re-flipping every launch.
+    var historyFilterCurrentWorkspace = false
+    /// The directory the checkbox would scope to, or nil when there is
+    /// nothing local to scope: no workspace, or an SSH workspace (its
+    /// sessions live on the remote — the local spawn dir says nothing about
+    /// them). The checkbox row shows exactly when this is non-nil, so the
+    /// view never restates the rule.
+    var historyScopeAnchor: URL? {
+        guard let workspace = active, workspace.sshRemoteHost == nil else { return nil }
+        return workspace.diskPath
+    }
+    /// The root the History pane filters by while the checkbox is on, else
+    /// nil: git's own answer for the anchor — the working-tree root above
+    /// its PHYSICAL path. Physical because git resolves cwd with `getcwd`,
+    /// so a symlink INTO a repo (`~/alias -> ~/repo/src`) belongs to
+    /// `~/repo` even though nothing above `~/alias` holds a `.git`. NOT the
+    /// anchor itself: `workingDirectory` follows the active tab's `cd`, so a
+    /// session launched at the project root would vanish the moment the
+    /// user cd's into `src/`. Outside any repo the workspace dir is the best
+    /// root there is. Not `gitStatus.repoRoot`: that is nil until a tab's
+    /// first prompt fetch lands (a restored tab may not have spawned yet)
+    /// and one prompt stale across a `cd` between repos.
+    var historyWorkspaceRoot: URL? {
+        guard historyFilterCurrentWorkspace, let anchor = historyScopeAnchor else { return nil }
+        let physical = canonicalDiskPath(anchor)
+        return GitWatcher.worktreeRoot(near: physical) ?? physical
+    }
+    /// `historyWorkspaceRoot` in every spelling a record's cwd may carry.
+    /// Most agents record the physical cwd, but Go's `os.Getwd` (Reasonix)
+    /// keeps the shell's LOGICAL `$PWD`, and the kernel keeps `/private`
+    /// where Foundation strips it — so beside the root itself: the logical
+    /// walk's root when it resolves to the same directory (a symlink ABOVE
+    /// the root, `~/code -> /Volumes/Dev/code`), the anchor's own logical
+    /// path (inside the root by construction, and the only logical spelling
+    /// a symlink INTO a repo has), and the `/private` form. Only roots are
+    /// resolved — resolving every record would stat paths on volumes long
+    /// gone. Empty when not filtering.
+    var historyWorkspaceRootPaths: [String] {
+        guard let root = historyWorkspaceRoot, let anchor = historyScopeAnchor else { return [] }
+        var paths = [root.path]
+        func add(_ path: String) {
+            if !paths.contains(where: { pathIsInside(path, root: $0) }) { paths.append(path) }
+        }
+        if let logicalRoot = GitWatcher.worktreeRoot(near: anchor),
+           canonicalDiskPath(logicalRoot).path == root.path {
+            add(logicalRoot.standardizedFileURL.path)
+        }
+        add(anchor.standardizedFileURL.path)
+        for path in paths { if let kernel = privateSpelling(of: path) { add(kernel) } }
+        return paths
+    }
     /// Session Info's collapsed sections, keyed by section title. Owned by the
     /// store for exactly the reason above — the page unmounts whenever the
     /// panel switches, so `@State` in the view would forget every collapse the
@@ -143,11 +237,34 @@ final class WorkspaceStore {
         }
         scheduleSave()
     }
+
     /// Full-mode sidebar width, user-draggable from the trailing edge.
     /// `SidebarView.fullWidth` is the floor (the design width — the sidebar
     /// can only grow); compact stays fixed at `compactWidth` and hidden is
     /// hidden, so this only applies while expanded. Persisted per window.
     var sidebarWidth: CGFloat = SidebarView.fullWidth
+
+    /// Full-mode right panel (Agent Panel) width, user-draggable from its
+    /// leading edge. `AgentOverviewSidebar.fullWidth` is the floor (the
+    /// design width — the panel can only grow); compact stays fixed at
+    /// `compactWidth` and hidden is hidden, so this only applies while
+    /// expanded. Persisted per window.
+    var rightSidebarWidth: CGFloat = AgentOverviewSidebar.fullWidth
+
+    /// True while a sidebar resize drag is in flight (either side). The
+    /// terminal engines suspend size propagation until the drag ends, avoiding
+    /// a SIGWINCH storm while SwiftUI updates the live frame.
+    var isSidebarResizing = false
+
+    func beginSidebarResize() {
+        isSidebarResizing = true
+        scheduleSave()
+    }
+
+    func endSidebarResize() {
+        isSidebarResizing = false
+        scheduleSave()
+    }
     /// File-tree state for the sidebar's files mode. Store-owned (not view
     /// `@State`) because it holds kqueue fds needing explicit teardown and
     /// the sidebar unmounts whole while hidden — `terminate()` is the
@@ -216,6 +333,26 @@ final class WorkspaceStore {
         guard rightSidebarContent != content else { return }
         rightSidebarContent = content
         scheduleSave()
+    }
+
+    /// Swap between the terminal tree and the Kanban board. Content-only:
+    /// the board overlays the (still mounted) pane host, so no
+    /// size-propagation suspension is needed.
+    func setMainContent(_ content: MainContent) {
+        guard mainContent != content else { return }
+        // Entering / leaving the split inset resizes every surface; suspend
+        // size propagation for the animation like a sidebar toggle does.
+        if mainContent == .kanbanSplit || content == .kanbanSplit {
+            suspendSizePropagationForLayoutAnimation(active?.root.allEngines ?? [])
+        }
+        mainContent = content
+        if content.showsKanban { lastKanbanContent = content }
+        scheduleSave()
+    }
+
+    /// ⌘⇧K / top-bar button: terminals ↔ the board in its last layout.
+    func toggleKanban() {
+        setMainContent(mainContent.showsKanban ? .terminals : lastKanbanContent)
     }
 
     /// Content-only swap — the sidebar keeps its width, so no size-propagation
@@ -364,19 +501,36 @@ final class WorkspaceStore {
     private var recentlyClosed: [ClosedTabState] = []
     private static let closedTabHistoryLimit = 50
 
-    private var pendingSave: Task<Void, Never>?
+    private(set) var pendingSave: Task<Void, Never>?
 
     /// Set by `terminate()`. The window layer drops its controller only on
     /// the NEXT main-queue tick (releasing an NSWindow synchronously inside
     /// windowWillClose crashes AppKit), so for one tick a dead store is
     /// still reachable through `windowControllers` — anything that acts on
     /// a store from outside the UI (the CLI) must skip it, or it lands a tab
-    /// in a store that is about to be dropped and reports success.
+    /// in a store that is about to be dropped and reports success. Hook-socket
+    /// ingress gates itself on it instead (`hookSession`).
     private(set) var isTerminated = false
     private static let saveDebounce: UInt64 = 1_000_000_000
 
     var active: Workspace? {
         workspaces.first { $0.id == activeWorkspaceId }
+    }
+
+    /// Locates a session in this store or any peer window's store. The
+    /// Kanban board reads a card's live agent state through this: cards are
+    /// app-wide, but the tab a card launched may live in another window.
+    func locateSession(_ sessionId: UUID) -> (store: WorkspaceStore, workspace: Workspace, session: Session)? {
+        let candidates = [self] + peerStores().filter { $0 !== self }
+        for store in candidates {
+            for workspace in store.workspaces {
+                if let pane = workspace.root.pane(containingSessionId: sessionId),
+                   let session = pane.tabs.first(where: { $0.id == sessionId }) {
+                    return (store, workspace, session)
+                }
+            }
+        }
+        return nil
     }
 
     init(
@@ -417,6 +571,8 @@ final class WorkspaceStore {
         forceResume: Bool = false,
         rawLaunchCommand: String? = nil,
         customTitle: String? = nil,
+        initialPrompt: String? = nil,
+        extraOptions: String? = nil,
         activate: Bool = true,
         spawnInBackground: Bool = false
     ) -> Workspace {
@@ -453,9 +609,11 @@ final class WorkspaceStore {
             initialCwd: dir,
             conversationId: conversationId,
             forceResume: forceResume,
+            initialPrompt: initialPrompt,
             sshRemoteHost: workspace.sshRemoteHost,
             rawLaunchCommand: rawLaunchCommand,
             customTitle: customTitle,
+            extraOptions: extraOptions,
             spawnInBackground: spawnInBackground
         )
         wireSessionCallbacks(engine: session.engine, session: session, workspace: workspace, codexRolloutId: session.resumedConversationId)
@@ -506,29 +664,16 @@ final class WorkspaceStore {
     ) async -> CreateWorktreeSheet.CreateOutcome {
         switch request.kind {
         case .create(let mode, let path, let branchForDisplay):
-            // repoRoot runs inside the detached task too — it is a git
-            // subprocess with a 2s timeout, and on the main actor it froze
-            // the UI for that long on slow/network filesystems.
-            let sourceDir = source.workingDirectory
-            let failureMessage: String? = await Task.detached(priority: .userInitiated) {
-                guard let repoPath = WorktreeManager.repoRoot(near: sourceDir) else {
-                    return "not inside a git repository"
-                }
-                if case .failure(let err) = WorktreeManager.add(repoPath: repoPath, path: path, mode: mode) {
-                    return err.description
-                }
-                return nil
-            }.value
-            if let failureMessage {
-                return .failure(failureMessage)
-            }
-            addWorkspace(
-                workingDirectory: path,
-                worktreeParent: source,
-                worktreeBranch: branchForDisplay,
+            switch await createWorktreeWorkspace(
+                source: source,
+                mode: mode,
+                path: path,
+                branchForDisplay: branchForDisplay,
                 template: request.template
-            )
-            return .success
+            ) {
+            case .success: return .success
+            case .failure(let error): return .failure(error.message)
+            }
         case .adopt(let worktrees):
             // Pure sidebar materialization — no git command, the
             // directories already exist on disk. One workspace per
@@ -546,6 +691,58 @@ final class WorkspaceStore {
         }
     }
 
+    /// Failure carrier for `createWorktreeWorkspace` — the git stderr (or a
+    /// kooky-side reason) the caller surfaces inline.
+    struct WorktreeCreationError: Error, Equatable {
+        let message: String
+    }
+
+    /// Runs `git worktree add` for `source` and materializes the resulting
+    /// directory as a child workspace, returning it so programmatic callers
+    /// (the Kanban board) can correlate the new workspace with what asked
+    /// for it. `initialPrompt` / `extraOptions` seed the workspace's first
+    /// tab — a card launches its agent with the card text in one spawn, not
+    /// a default shell plus a second tab.
+    func createWorktreeWorkspace(
+        source: Workspace,
+        mode: WorktreeManager.BranchMode,
+        path: URL,
+        branchForDisplay: String,
+        template: AgentTemplate,
+        initialPrompt: String? = nil,
+        extraOptions: String? = nil,
+        activate: Bool = true,
+        spawnInBackground: Bool = false
+    ) async -> Result<Workspace, WorktreeCreationError> {
+        // repoRoot runs inside the detached task too — it is a git
+        // subprocess with a 2s timeout, and on the main actor it froze
+        // the UI for that long on slow/network filesystems.
+        let sourceDir = source.workingDirectory
+        let failureMessage: String? = await Task.detached(priority: .userInitiated) {
+            guard let repoPath = WorktreeManager.repoRoot(near: sourceDir) else {
+                return "not inside a git repository"
+            }
+            if case .failure(let err) = WorktreeManager.add(repoPath: repoPath, path: path, mode: mode) {
+                return err.description
+            }
+            return nil
+        }.value
+        if let failureMessage {
+            return .failure(WorktreeCreationError(message: failureMessage))
+        }
+        let workspace = addWorkspace(
+            workingDirectory: path,
+            worktreeParent: source,
+            worktreeBranch: branchForDisplay,
+            template: template,
+            initialPrompt: initialPrompt,
+            extraOptions: extraOptions,
+            activate: activate,
+            spawnInBackground: spawnInBackground
+        )
+        return .success(workspace)
+    }
+
     /// Worktree workspaces close through this request first so the
     /// sidebar can pop the brutalist confirm sheet before anything
     /// destructive runs. Plain workspaces skip the prompt and go
@@ -553,6 +750,11 @@ final class WorkspaceStore {
     /// close this worktree, sidebar please ask them about the dir";
     /// cleared by the sheet on dismiss / confirm.
     var pendingRemovalRequest: Workspace?
+
+    /// Sidebar right-click → "New Kanban Card…": the repo root the board
+    /// should open its editor for. Runtime-only; the board consumes and
+    /// clears it.
+    var pendingNewCardProjectRoot: URL?
 
     /// Cross-view create request. Sidebar rows open the sheet directly, but
     /// global entry points such as the command palette need to ask the
@@ -799,10 +1001,8 @@ final class WorkspaceStore {
     private func pruneRecentlyClosed(under workspace: Workspace) {
         let root = workspace.diskPath.standardizedFileURL.path
         recentlyClosed.removeAll { entry in
-            let cwd = entry.cwd.standardizedFileURL.path
-            return entry.workspaceId == workspace.id
-                || cwd == root
-                || cwd.hasPrefix(root + "/")
+            entry.workspaceId == workspace.id
+                || pathIsInside(entry.cwd.standardizedFileURL.path, root: root)
         }
     }
 
@@ -960,6 +1160,7 @@ final class WorkspaceStore {
         initialPrompt: String? = nil,
         rawLaunchCommand: String? = nil,
         customTitle: String? = nil,
+        extraOptions: String? = nil,
         activate: Bool = true,
         spawnInBackground: Bool = false
     ) -> Session {
@@ -981,7 +1182,7 @@ final class WorkspaceStore {
         let cwd = initialCwd
             ?? template.extraCwd.map { resolvedSpawnCwd(($0 as NSString).expandingTildeInPath) }
             ?? workspace.workingDirectory
-        let session = spawnSession(template: template, initialCwd: cwd, conversationId: conversationId, forceResume: forceResume, initialPrompt: initialPrompt, sshRemoteHost: workspace.sshRemoteHost, rawLaunchCommand: rawLaunchCommand, customTitle: customTitle, spawnInBackground: spawnInBackground)
+        let session = spawnSession(template: template, initialCwd: cwd, conversationId: conversationId, forceResume: forceResume, initialPrompt: initialPrompt, sshRemoteHost: workspace.sshRemoteHost, rawLaunchCommand: rawLaunchCommand, customTitle: customTitle, extraOptions: extraOptions, spawnInBackground: spawnInBackground)
         wireSessionCallbacks(engine: session.engine, session: session, workspace: workspace, codexRolloutId: session.resumedConversationId)
         target.tabs.append(session)
         // `activate: false` (CLI --no-focus) appends WITHOUT touching the
@@ -1645,9 +1846,10 @@ final class WorkspaceStore {
     /// Routes a hook event to the named session. On `.ended`, drops the leaf
     /// back to `.terminal` only if the agent reporting end matches the
     /// session's current agent — otherwise a Codex run inside a Claude tab
-    /// (or a delayed `ended`) would wipe the still-active icon.
+    /// (or a delayed `ended`) would wipe the still-active icon. Dropped once
+    /// `terminate()` has run (`hookSession`).
     func applyHookEvent(agent: AgentTemplate, event: HookEvent, sessionId: UUID) {
-        guard let session = findSession(id: sessionId) else { return }
+        guard let session = hookSession(id: sessionId) else { return }
         let agentBefore = session.agent.id
         if event == .ended {
             // A custom agent based on this builtin shares its binary's
@@ -1687,7 +1889,7 @@ final class WorkspaceStore {
     }
 
     func applyShellEnvironment(_ env: [String: String], sessionId: UUID) {
-        guard let session = findSession(id: sessionId) else { return }
+        guard let session = hookSession(id: sessionId) else { return }
         session.shellEnvironment = env
         refreshEnvironment(for: session)
     }
@@ -1699,7 +1901,7 @@ final class WorkspaceStore {
     /// on every SessionStart / UserPromptSubmit / Stop / SessionEnd, so the
     /// dedup keeps the debounce loop quiet.
     func applyConversationId(conversationId: String, sessionId: UUID) {
-        guard let session = findSession(id: sessionId) else { return }
+        guard let session = hookSession(id: sessionId) else { return }
         guard session.conversationId != conversationId else { return }
         session.conversationId = conversationId
         scheduleSave()
@@ -1719,7 +1921,7 @@ final class WorkspaceStore {
         toolUseId: String?,
         sessionId: UUID
     ) {
-        guard let session = findSession(id: sessionId) else { return }
+        guard let session = hookSession(id: sessionId) else { return }
 
         switch event {
         case .pre:
@@ -1754,6 +1956,19 @@ final class WorkspaceStore {
 
     private func findSession(id: UUID) -> Session? {
         location(ofSessionId: id)?.pane.tabs.first { $0.id == id }
+    }
+
+    /// A hook-socket message's target session, or `nil` once `terminate()`
+    /// has run — from then on kooky itself is killing the engines, so hook
+    /// traffic is a teardown echo. On ⌘Q the drain waits for the SIGHUP'd
+    /// agent to exit with the socket still listening, and the agent's own
+    /// shutdown hook pings `ended`; applied, that reverts the tab to
+    /// `.terminal` and the post-drain flush persists a plain terminal, so
+    /// the next launch neither relaunches nor resumes it (#70). The OSC-2
+    /// marker path needs no twin: `releaseSurface` seals the byte stream
+    /// before the drain starts.
+    private func hookSession(id: UUID) -> Session? {
+        isTerminated ? nil : findSession(id: id)
     }
 
     /// Re-resolves every live session's `agent` against the current templates.
@@ -1869,9 +2084,14 @@ final class WorkspaceStore {
         rightSidebarMode = state.rightSidebarMode ?? .hidden
         sidebarContent = state.sidebarContent ?? .workspaces
         rightSidebarContent = state.rightSidebarContent ?? .agents
+        mainContent = state.mainContent ?? .terminals
+        if mainContent.showsKanban { lastKanbanContent = mainContent }
         sidebarWidth = state.sidebarWidth
             .map { SidebarView.clampWidth(CGFloat($0)) }
             ?? SidebarView.fullWidth
+        rightSidebarWidth = state.rightSidebarWidth
+            .map { AgentOverviewSidebar.clampWidth(CGFloat($0)) }
+            ?? AgentOverviewSidebar.fullWidth
         collapsedInfoSections = Set(state.collapsedInfoSections ?? [])
     }
 
@@ -1913,12 +2133,19 @@ final class WorkspaceStore {
     /// Spawns the engine + Session. Caller wires `onPwdChange` / `onFocus`
     /// after a workspace ref is available — `restore` builds sessions before
     /// the workspace exists, so callbacks can't capture it here.
-    private func spawnSession(template: AgentTemplate, initialCwd: URL, sessionId: UUID = UUID(), conversationId: String? = nil, forceResume: Bool = false, initialPrompt: String? = nil, sshRemoteHost: String? = nil, rawLaunchCommand: String? = nil, customTitle: String? = nil, spawnInBackground: Bool = false) -> Session {
+    private func spawnSession(template: AgentTemplate, initialCwd: URL, sessionId: UUID = UUID(), conversationId: String? = nil, forceResume: Bool = false, initialPrompt: String? = nil, sshRemoteHost: String? = nil, rawLaunchCommand: String? = nil, customTitle: String? = nil, extraOptions callerOptions: String? = nil, spawnInBackground: Bool = false) -> Session {
         let engine = engineFactory()
         // Before `engine.start` (and before any view mounts): the flag is
         // what lets the surface come up under a hidden mount (issue #59).
         engine.spawnsWhileHidden = spawnInBackground
-        let extraOptions = optionsProvider(template.id)
+        // Per-launch options (a Kanban card's `--model …`) ride AFTER the
+        // user's global per-agent options so a card can override them —
+        // most CLIs honour the last occurrence of a repeated flag.
+        let mergedOptions = [optionsProvider(template.id), callerOptions]
+            .compactMap { $0?.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        let extraOptions = mergedOptions.isEmpty ? nil : mergedOptions
         let persistsConversation = template.persistsConversation(extraOptions: extraOptions)
         // Resume gated by user setting — `resumeConversations` flips this off
         // when the user wants every agent tab to start fresh without
@@ -2542,7 +2769,16 @@ final class WorkspaceStore {
         session.environment = env
     }
 
-    private func scheduleSave() {
+    /// Debounced persistence of the whole snapshot — every mutation site and
+    /// the window controller's frame changes funnel here (the frame itself is
+    /// read by `WindowPersistence.frameProvider` at write time). A torn-down
+    /// store never re-arms: after a red-button close `removeWindow` has
+    /// dropped the slot, and a late AppKit notification or a click on the
+    /// still-visible dead window would otherwise upsert it back. ⌘Q's drain
+    /// loses nothing to this — its post-drain `flushPersistence` is ungated
+    /// and snapshots the live state.
+    func scheduleSave() {
+        guard !isTerminated else { return }
         pendingSave?.cancel()
         pendingSave = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: Self.saveDebounce)
@@ -2559,7 +2795,9 @@ final class WorkspaceStore {
             rightSidebarMode: rightSidebarMode,
             sidebarContent: sidebarContent,
             rightSidebarContent: rightSidebarContent,
+            mainContent: mainContent,
             sidebarWidth: Double(sidebarWidth),
+            rightSidebarWidth: Double(rightSidebarWidth),
             collapsedInfoSections: collapsedInfoSections.isEmpty
                 ? nil
                 : collapsedInfoSections.sorted()

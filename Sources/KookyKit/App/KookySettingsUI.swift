@@ -297,6 +297,35 @@ final class KookySettingsModel {
     /// Persisted under `notifications.attention` / `.failure` (non-default only).
     var notifyOnAttention: Bool = true
     var notifyOnFailure: Bool = true
+    /// "Archive Done cards after N days" — the board's auto-archive sweep
+    /// (`KanbanStore.startAutoArchive`), off by default. The day count is
+    /// kept while the toggle is off so turning it back on keeps the number.
+    /// Persisted under `kanban.autoArchive` / `kanban.autoArchiveDays`
+    /// (non-default only).
+    var kanbanAutoArchiveEnabled: Bool = false
+    var kanbanAutoArchiveDays: Int = KookySettingsModel.defaultKanbanAutoArchiveDays
+    static let defaultKanbanAutoArchiveDays = 30
+    /// nil = off; what the sweep reads.
+    var effectiveKanbanAutoArchiveDays: Int? {
+        kanbanAutoArchiveEnabled ? max(1, kanbanAutoArchiveDays) : nil
+    }
+
+    /// `kanban.autoArchiveDays` from settings.json: a positive integer, else
+    /// the default. Static so tests cover the hand-edited-file cases.
+    static func resolvedKanbanAutoArchiveDays(_ raw: Any?) -> Int {
+        guard let days = raw as? Int, days > 0 else { return defaultKanbanAutoArchiveDays }
+        return days
+    }
+
+    /// The `kanban` section of settings.json as the two model fields — off
+    /// and the default day count when absent. Pure, like the other
+    /// `resolved…` readers, so tests never depend on the user's real file.
+    static func resolvedKanbanAutoArchive(_ kanban: [String: Any]) -> (enabled: Bool, days: Int) {
+        (
+            enabled: (kanban["autoArchive"] as? Bool) ?? false,
+            days: resolvedKanbanAutoArchiveDays(kanban["autoArchiveDays"])
+        )
+    }
     /// "Open in" picker (top-chrome split button): user-customised order of
     /// `OpenInApp` ids; installed apps absent from this list follow in catalog
     /// order. Persisted under `openin.order`.
@@ -422,6 +451,10 @@ final class KookySettingsModel {
         notificationsEnabled = (notifications["enabled"] as? Bool) ?? true
         notifyOnAttention = (notifications["attention"] as? Bool) ?? true
         notifyOnFailure = (notifications["failure"] as? Bool) ?? true
+
+        let kanban = Self.resolvedKanbanAutoArchive(parsed["kanban"] as? [String: Any] ?? [:])
+        kanbanAutoArchiveEnabled = kanban.enabled
+        kanbanAutoArchiveDays = kanban.days
 
         let openin = parsed["openin"] as? [String: Any] ?? [:]
         openInAppOrder = (openin["order"] as? [String]) ?? []
@@ -677,6 +710,17 @@ final class KookySettingsModel {
             parsed.removeValue(forKey: "notifications")
         } else {
             parsed["notifications"] = notifications
+        }
+
+        var kanban = parsed["kanban"] as? [String: Any] ?? [:]
+        kanban["autoArchive"] = kanbanAutoArchiveEnabled ? true : nil
+        kanban["autoArchiveDays"] = kanbanAutoArchiveDays == Self.defaultKanbanAutoArchiveDays
+            ? nil
+            : kanbanAutoArchiveDays
+        if kanban.isEmpty {
+            parsed.removeValue(forKey: "kanban")
+        } else {
+            parsed["kanban"] = kanban
         }
 
         var openin = parsed["openin"] as? [String: Any] ?? [:]
@@ -1091,10 +1135,10 @@ struct KookySettingsView: View {
     @State private var selected: SettingsCategory = .general
 
     var body: some View {
-        // The autosave `.onChange` observers are split across two statements
-        // via an intermediate `let`: a single chain this long (16 modifiers)
+        // The autosave `.onChange` observers are split across three
+        // statements via intermediate `let`s: a single chain this long
         // overruns the Swift type-checker's budget ("unable to type-check in
-        // reasonable time"). Each half stays comfortably under the limit.
+        // reasonable time"). Each part stays comfortably under the limit.
         let core = HStack(spacing: 0) {
             sidebar
             Rectangle().fill(Theme.chromeHairline).frame(width: 1)
@@ -1120,7 +1164,7 @@ struct KookySettingsView: View {
         .onChange(of: model.fileLinkAppId) { _, _ in model.scheduleSave() }
         .onChange(of: model.webLinkAppId) { _, _ in model.scheduleSave() }
 
-        return core
+        let more = core
             .onChange(of: model.customAgents) { _, _ in model.scheduleSave() }
             .onChange(of: model.resumeConversations) { _, _ in model.scheduleSave() }
             .onChange(of: model.sshRemoteAgentDetection) { _, _ in model.scheduleSave() }
@@ -1137,6 +1181,10 @@ struct KookySettingsView: View {
             .onChange(of: model.notificationsEnabled) { _, _ in model.scheduleSave() }
             .onChange(of: model.notifyOnAttention) { _, _ in model.scheduleSave() }
             .onChange(of: model.notifyOnFailure) { _, _ in model.scheduleSave() }
+
+        return more
+            .onChange(of: model.kanbanAutoArchiveEnabled) { _, _ in model.scheduleSave() }
+            .onChange(of: model.kanbanAutoArchiveDays) { _, _ in model.scheduleSave() }
     }
 
     private var sidebar: some View {
@@ -1420,6 +1468,29 @@ struct KookySettingsView: View {
                         .labelsHidden()
                         .toggleStyle(.switch)
                 }
+            }
+            .padding(.top, 22)
+
+            SettingsSection(title: "Kanban") {
+                SettingsRow(label: "archive-done-cards") {
+                    HStack(spacing: 8) {
+                        Text("^[after \(model.kanbanAutoArchiveDays) day](inflect: true)", bundle: .kookyResources)
+                        .font(Theme.mono(12))
+                        .foregroundStyle(model.kanbanAutoArchiveEnabled ? Theme.chromeForeground : Theme.chromeMuted)
+                        .monospacedDigit()
+                        Stepper(value: $model.kanbanAutoArchiveDays, in: 1...365) {
+                            Text("Days before a Done card is archived", bundle: .kookyResources)
+                        }
+                        .labelsHidden()
+                        .disabled(!model.kanbanAutoArchiveEnabled)
+                        Toggle(isOn: $model.kanbanAutoArchiveEnabled) {
+                            Text("Archive Done cards automatically", bundle: .kookyResources)
+                        }
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                    }
+                }
+                SettingsCaption("Done cards whose last activity is older than this move to the archive at launch and once a day.")
             }
             .padding(.top, 22)
 

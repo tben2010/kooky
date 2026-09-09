@@ -176,4 +176,78 @@ final class PaneTreeHostTests: XCTestCase {
             "the SwiftUI split tree should mount the terminal view inside the workspace's persistent container"
         )
     }
+
+    func testTerminalTabHostRetainsVisitedViews() throws {
+        let store = makeStore()
+        let workspace = try XCTUnwrap(store.active)
+        let first = try XCTUnwrap(workspace.activeSession)
+        let second = store.addTab(in: workspace)
+        let host = TerminalTabHostView()
+        host.frame = NSRect(x: 0, y: 0, width: 800, height: 600)
+
+        host.update(tabs: workspace.activePane?.tabs ?? [], activeTabId: second.id, grabsFocusOnMount: true)
+        XCTAssertTrue(second.engine.view.superview === host)
+        XCTAssertNil(first.engine.view.superview, "unvisited tabs stay lazy")
+
+        host.update(tabs: workspace.activePane?.tabs ?? [], activeTabId: first.id, grabsFocusOnMount: true)
+        XCTAssertTrue(first.engine.view.superview === host)
+        XCTAssertTrue(second.engine.view.superview === host)
+        XCTAssertTrue(second.engine.view.isHidden)
+        let firstView = first.engine.view
+
+        host.update(tabs: workspace.activePane?.tabs ?? [], activeTabId: second.id, grabsFocusOnMount: true)
+        XCTAssertTrue(first.engine.view === firstView, "switching back must reuse the mounted NSView")
+        XCTAssertTrue(first.engine.view.isHidden)
+        XCTAssertFalse(second.engine.view.isHidden)
+    }
+
+    func testTerminalTabHostMountsBackgroundSpawningTabs() throws {
+        let store = makeStore()
+        let workspace = try XCTUnwrap(store.active)
+        let visible = try XCTUnwrap(workspace.activeSession)
+        let background = store.addTab(
+            in: workspace,
+            activate: false,
+            spawnInBackground: true
+        )
+        let host = TerminalTabHostView()
+        host.frame = NSRect(x: 0, y: 0, width: 800, height: 600)
+
+        host.update(
+            tabs: workspace.activePane?.tabs ?? [],
+            activeTabId: visible.id,
+            grabsFocusOnMount: true
+        )
+
+        XCTAssertTrue(visible.engine.view.superview === host)
+        XCTAssertTrue(
+            background.engine.view.superview === host,
+            "CLI --no-focus tabs need a hidden mount so their real shell starts"
+        )
+        XCTAssertTrue(background.engine.view.isHidden)
+    }
+
+    func testOldTerminalTabHostCannotMutateAReparentedView() throws {
+        let store = makeStore()
+        let workspace = try XCTUnwrap(store.active)
+        let session = try XCTUnwrap(workspace.activeSession)
+        let source = TerminalTabHostView()
+        source.frame = NSRect(x: 0, y: 0, width: 400, height: 300)
+        let destination = TerminalTabHostView()
+        destination.frame = NSRect(x: 0, y: 0, width: 800, height: 600)
+
+        source.update(tabs: [session], activeTabId: session.id, grabsFocusOnMount: true)
+        destination.update(tabs: [session], activeTabId: session.id, grabsFocusOnMount: true)
+        XCTAssertTrue(session.engine.view.superview === destination)
+
+        source.layout()
+        XCTAssertEqual(session.engine.view.frame, destination.bounds)
+
+        source.update(tabs: [], activeTabId: nil, grabsFocusOnMount: false)
+        XCTAssertTrue(
+            session.engine.view.superview === destination,
+            "the old pane must not detach a terminal after the new pane adopted it"
+        )
+    }
+
 }

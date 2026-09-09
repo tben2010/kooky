@@ -56,9 +56,15 @@ private struct PaneView: View {
     /// a plain NSView, never matched.
     private func focusThisPane() {
         guard let active = pane.activeTab else { return }
-        store.activateTab(active, in: workspace)
         let view = active.engine.view
+        store.activateTab(active, in: workspace)
         guard let window = view.window else { return }
+        // TabBarItem activates the selected tab in its own tap handler. The
+        // pane-wide simultaneous gesture also receives that click; if the
+        // current terminal is already first responder, do not focus it again.
+        // Otherwise a tab click briefly focuses the old surface before the
+        // selected tab's host update focuses the new one.
+        if workspace.activePaneId == pane.id, window.firstResponder === view { return }
         if window.firstResponder is NSTextView { return }
         window.makeFirstResponder(view)
     }
@@ -66,46 +72,25 @@ private struct PaneView: View {
     @State private var contextMenuOpen = false
     @State private var contextMenuAnchor: UnitPoint = .center
 
-    /// CLI background tabs (`open --no-focus`, issue #59) whose shell must
-    /// run WITHOUT ever being shown. Each gets an offscreen, hidden engine
-    /// mount below so the surface can spawn; the active tab is excluded —
-    /// its mount is the visible one, and `engine.view` is a single NSView
-    /// that can only have one parent.
-    private var backgroundSpawningTabs: [Session] {
-        pane.tabs.filter { $0.spawnsInBackground && $0.id != pane.activeTabId }
-    }
-
     var body: some View {
         let paneOpacity = isFocused ? 1.0 : Self.inactivePaneOpacity
         VStack(spacing: 0) {
             TabBarView(pane: pane, workspace: workspace, store: store)
             Rectangle().fill(Theme.chromeSeparator).frame(height: 1)
             if let active = pane.activeTab {
-                // The workspace-visibility condition is load-bearing in C2:
-                // every workspace's tree is mounted (hidden containers), so
-                // without it each workspace's own active pane grabs on mount —
-                // at restore the LAST workspace mounted wins the keyboard, and
-                // a background tab auto-close can re-mount and yank focus from
-                // the terminal the user is typing in (Codex P1).
-                TerminalView(
-                    engine: active.engine,
+                TerminalTabHost(
+                    tabs: pane.tabs,
+                    activeTabId: pane.activeTabId,
+                    // The workspace-visibility condition is load-bearing in C2:
+                    // every workspace's tree is mounted (hidden containers), so
+                    // without it each workspace's own first surface grabs on mount —
+                    // at restore the LAST workspace mounted wins the keyboard, and
+                    // a background tab auto-close can re-mount and yank focus from
+                    // the terminal the user is typing in (Codex P1).
                     grabsFocusOnMount: isFocused && store.activeWorkspaceId == workspace.id
                 )
-                    .id(active.id)
-                    // Offscreen engine mounts for CLI background tabs
-                    // (issue #59): surface creation needs the engine view
-                    // in a real window with real bounds. A background layer
-                    // of the pane's primary terminal gives each one the
-                    // same frame — the same cell grid — so promoting it
-                    // later is resize-free, and it is attached AFTER `.id`
-                    // so tab switches must not remount these. Hidden via
-                    // real `isHidden` (render link parks), focus-grab off.
-                    .background {
-                        ForEach(backgroundSpawningTabs) { tab in
-                            TerminalView(engine: tab.engine, grabsFocusOnMount: false, visible: false)
-                                .allowsHitTesting(false)
-                                .accessibilityHidden(true)
-                        }
+                    .transaction { transaction in
+                        transaction.animation = nil
                     }
                     .padding(8)
                     .overlay(RightClickCatcher { unit in
@@ -201,7 +186,6 @@ private struct PaneView: View {
             else { return }
             focusThisPane()
         }
-        .animation(Theme.chromeTransition, value: isFocused)
         .onChange(of: pane.activeTab.map { paneStatusBarHasData(session: $0) } ?? false) { _, _ in
             // Status-bar height transition. The bar is always present now (it
             // hosts the compose button), so this fires when its CONTENT height

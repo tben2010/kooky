@@ -128,6 +128,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         settings.onThemeAppearanceChanged = { [weak self] in
             self?.refreshThemeAppearances()
         }
+        // The board lives app-wide but a card's agent tab lives in one
+        // window; "Show Agent Tab" needs the cross-window reveal only the
+        // delegate can do (front the right window, then activate).
+        KanbanStore.shared.revealSession = { [weak self] sessionId in
+            self?.revealSessionForKanban(sessionId)
+        }
+        // Done cards older than the configured age leave the board on their
+        // own — at launch, then daily. A no-op until the user turns it on.
+        KanbanStore.shared.startAutoArchive { settings.effectiveKanbanAutoArchiveDays }
         systemAppearanceObservation = NSApp.observe(
             \.effectiveAppearance,
             options: [.new]
@@ -255,27 +264,52 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     /// workspace; a restored id loads that window's persisted slice.
     @discardableResult
     private func addWindow(windowId: UUID = UUID()) -> KookyWindowController {
+        let persistence = WindowPersistence(windowId: windowId, app: appPersistence)
         let store = WorkspaceStore(
-            persistence: WindowPersistence(windowId: windowId, app: appPersistence),
+            persistence: persistence,
             peerStores: { [weak self] in self?.windowControllers.map(\.store) ?? [] },
             moveToNewWindow: { [weak self] id in self?.moveTabToNewWindow(sessionId: id) },
             onSessionAlert: { [weak self] id, kind in self?.handleSessionAlert(id, kind) },
             noteRecentFolder: { RecentFolders.shared.note($0) }
         )
         let controller = KookyWindowController(windowId: windowId, store: store)
+        persistence.frameProvider = { [weak controller] in controller?.persistableFrame }
         controller.onWillClose = { [weak self] in self?.handleWindowWillClose($0) }
         controller.onDidBecomeKey = { [weak self] in self?.lastKeyController = $0 }
+        // The window a frame-less newcomer copies its size from: the key
+        // window for ⌘⇧N / "Move to New Window", the previous one at launch.
+        let reference = activeController?.persistableFrame
         windowControllers.append(controller)
         if let window = controller.window {
-            if windowControllers.count == 1 {
-                window.center()
-                cascadePoint = NSPoint(x: window.frame.minX, y: window.frame.maxY)
-            } else {
-                cascadePoint = window.cascadeTopLeft(from: cascadePoint)
-            }
+            place(window, restoring: appPersistence.frame(for: windowId), inheritingSizeFrom: reference)
             window.makeKeyAndOrderFront(nil)
         }
         return controller
+    }
+
+    /// A window with a saved frame goes back where it was (see
+    /// `WindowPlacement` for the screen-layout clamping). Without one — fresh
+    /// install, a pre-v0.51.9 state.json, ⌘⇧N — it takes the reference
+    /// window's size and is centered / cascaded as before; the cascade
+    /// continues from wherever the last window landed either way.
+    private func place(_ window: NSWindow, restoring saved: PersistedFrame?, inheritingSizeFrom reference: PersistedFrame?) {
+        if let saved,
+           let frame = WindowPlacement.restoredFrame(
+               saved.rect, minSize: window.minSize, screens: NSScreen.screens.map(\.visibleFrame)
+           ) {
+            window.setFrame(frame, display: false)
+            cascadePoint = NSPoint(x: frame.minX, y: frame.maxY)
+            return
+        }
+        if let reference {
+            window.setFrame(NSRect(origin: window.frame.origin, size: reference.rect.size), display: false)
+        }
+        if windowControllers.count == 1 {
+            window.center()
+            cascadePoint = NSPoint(x: window.frame.minX, y: window.frame.maxY)
+        } else {
+            cascadePoint = window.cascadeTopLeft(from: cascadePoint)
+        }
     }
 
     /// Right-click → "Move to New Window": creates a fresh window and pulls
@@ -385,6 +419,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
               let hit = dockTabLocation(for: id)
         else { return }
         NSApp.activate(ignoringOtherApps: true)
+        revealTab(hit.session, in: hit.workspace, controller: hit.controller)
+    }
+
+    /// Kanban card → its agent tab. Same reveal as the Dock jump, plus the
+    /// owning window flips back from the board to the terminals so the tab
+    /// is actually visible after the jump.
+    private func revealSessionForKanban(_ sessionId: UUID) {
+        guard let hit = dockTabLocation(for: sessionId) else { return }
+        // A split board keeps showing — the tab lands in its right half.
+        if hit.controller.store.mainContent == .kanban {
+            withAnimation(Theme.chromeTransition) {
+                hit.controller.store.setMainContent(.terminals)
+            }
+        }
         revealTab(hit.session, in: hit.workspace, controller: hit.controller)
     }
 
@@ -797,6 +845,23 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             workspace: workspace,
             isRead: visible
         )
+        // A Kanban card's agent exiting is the board's "hand it back to the
+        // human" signal: In Progress → In Review (or back to Ready when it
+        // died right after start / with a non-zero status). Fallback for
+        // agents that never call `kooky-cli card --done`.
+        switch kind {
+        case .completed:
+            if let conversationId = location.session.conversationId {
+                KanbanStore.shared.recordConversationId(conversationId, forSession: sessionId)
+            }
+            KanbanStore.shared.agentFinished(sessionId: sessionId)
+        case .failure:
+            if let exit = location.session.lastCommandExit {
+                KanbanStore.shared.agentFailed(sessionId: sessionId, exitCode: exit)
+            }
+        default:
+            break
+        }
         // System banner: attention / failure only, gated on the setting + its
         // sub-toggle + visibility. Completed is inbox-only (never a banner).
         let settings = KookySettingsModel.shared
@@ -1008,6 +1073,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         for controller in windowControllers {
             controller.store.flushPersistence()
         }
+        KanbanStore.shared.flush()
         // If closed-lid mode is engaged, re-enable lid sleep before dying —
         // a system-wide pmset flag outlives the process, unlike assertions.
         SleepGuard.shared.shutdownCleanup()
@@ -1111,6 +1177,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         }
         let viewEntries: [MenuEntry] = [
             selfRow("Toggle Sidebar", #selector(handleToggleSidebar), "s", modifiers: [.command, .control]),
+            selfRow("Kanban Board", #selector(handleToggleKanban), "k", modifiers: [.command, .shift]),
             .separator,
             selfRow("Increase Font Size", #selector(handleIncreaseFontSize), "="),
             selfRow("Decrease Font Size", #selector(handleDecreaseFontSize), "-"),
@@ -1356,7 +1423,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
                 return PaletteIndex.build(
                     controllers: self.windowControllers,
                     model: KookySettingsModel.shared,
-                    recentFolders: RecentFolders.shared.existing
+                    recentFolders: RecentFolders.shared.existing,
+                    activeWorkspace: self.activeStore?.active
                 )
             },
             anchor: activeController?.window,
@@ -1407,6 +1475,18 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
             handleNewSSHWorkspace()
         case .openRecentFolder(let path):
             openRecentFolder(atPath: path)
+        case .kanbanBoard:
+            guard let store = activeStore, !store.mainContent.showsKanban else { return }
+            withAnimation(Theme.chromeTransition) {
+                store.toggleKanban()
+            }
+        case .newKanbanCard:
+            // Same path as the sidebar's context-menu entry; the index only
+            // offers this row while the active workspace is a git checkout.
+            guard let store = activeStore, let ws = store.active else { return }
+            Task { @MainActor in
+                await KanbanLaunchCoordinator.presentNewCard(for: ws, in: store)
+            }
         }
     }
 
@@ -1670,6 +1750,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         guard let store = activeStore else { return }
         withAnimation(Theme.chromeTransition) {
             store.setSidebarMode(store.sidebarMode.next)
+        }
+    }
+
+    @objc private func handleToggleKanban() {
+        guard let store = activeStore else { return }
+        withAnimation(Theme.chromeTransition) {
+            store.toggleKanban()
         }
     }
 

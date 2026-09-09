@@ -193,6 +193,13 @@ final class PaneTreeHostView: FlippedLayoutView {
         window.makeFirstResponder(target)
     }
 
+    /// Re-hand the keyboard to the active terminal after something else
+    /// (the Kanban board overlay) owned it. Forced: the focus key hasn't
+    /// changed, only who holds the responder chain.
+    func focusActiveTerminal() {
+        syncFocus(force: true)
+    }
+
     // MARK: - Test hooks
 
     func workspaceRootView(for id: UUID) -> WorkspaceRootView? { workspaceViews[id] }

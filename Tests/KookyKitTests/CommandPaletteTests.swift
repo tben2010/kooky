@@ -142,3 +142,101 @@ final class PaletteIndexRecentFolderTests: XCTestCase {
         })
     }
 }
+
+@MainActor
+final class PaletteIndexNewKanbanCardTests: XCTestCase {
+    private var scratch: URL!
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("palette-kanban-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: scratch)
+        try super.tearDownWithError()
+    }
+
+    private func gitRepo(named name: String) throws -> URL {
+        let repo = scratch.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: repo.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        return repo
+    }
+
+    private func plainFolder(named name: String) throws -> URL {
+        let dir = scratch.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private func newCardItems(activeWorkspace: Workspace?) -> [PaletteItem] {
+        PaletteIndex.build(
+            controllers: [],
+            model: KookySettingsModel.shared,
+            activeWorkspace: activeWorkspace
+        ).filter { $0.kind == .newKanbanCard }
+    }
+
+    func testGitWorkspaceOffersNewKanbanCard() throws {
+        let store = makeTestStore()
+        let ws = store.addWorkspace(workingDirectory: try gitRepo(named: "repo"))
+
+        let items = newCardItems(activeWorkspace: ws)
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items.first?.id, "new-kanban-card")
+        XCTAssertEqual(items.first?.title, "New Kanban Card…")
+        XCTAssertFalse(items.first?.subtitle.isEmpty ?? true)
+        XCTAssertFalse(items.first?.symbol.isEmpty ?? true)
+    }
+
+    func testSubdirectoryOfGitRepoStillOffersNewKanbanCard() throws {
+        // The gate walks up like the sidebar's repo-root resolution does —
+        // a workspace opened on `repo/Sources` still belongs to the repo.
+        let store = makeTestStore()
+        let sub = try gitRepo(named: "repo").appendingPathComponent("Sources", isDirectory: true)
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        let ws = store.addWorkspace(workingDirectory: sub)
+
+        XCTAssertEqual(newCardItems(activeWorkspace: ws).count, 1)
+    }
+
+    func testNonGitWorkspaceDoesNotOfferNewKanbanCard() throws {
+        let store = makeTestStore()
+        let ws = store.addWorkspace(workingDirectory: try plainFolder(named: "notes"))
+
+        XCTAssertTrue(newCardItems(activeWorkspace: ws).isEmpty)
+    }
+
+    func testSSHWorkspaceDoesNotOfferNewKanbanCard() throws {
+        // Even inside a local checkout, a remote workspace's cards would
+        // point at the wrong machine — mirrors the sidebar's context menu.
+        let store = makeTestStore()
+        let ws = store.addWorkspace(workingDirectory: try gitRepo(named: "repo"))
+        ws.sshRemoteHost = "build-box"
+
+        XCTAssertTrue(newCardItems(activeWorkspace: ws).isEmpty)
+    }
+
+    func testNoActiveWorkspaceDoesNotOfferNewKanbanCard() {
+        XCTAssertTrue(newCardItems(activeWorkspace: nil).isEmpty)
+    }
+
+    func testNewKanbanCardFollowsKanbanBoardEntry() throws {
+        let store = makeTestStore()
+        let ws = store.addWorkspace(workingDirectory: try gitRepo(named: "repo"))
+        let items = PaletteIndex.build(
+            controllers: [],
+            model: KookySettingsModel.shared,
+            activeWorkspace: ws
+        )
+
+        let boardIndex = try XCTUnwrap(items.firstIndex { $0.kind == .kanbanBoard })
+        let cardIndex = try XCTUnwrap(items.firstIndex { $0.kind == .newKanbanCard })
+        XCTAssertEqual(cardIndex, boardIndex + 1, "the card entry sits directly under Kanban Board")
+    }
+}

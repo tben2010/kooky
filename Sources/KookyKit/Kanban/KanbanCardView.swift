@@ -1,0 +1,365 @@
+import SwiftUI
+
+/// Compact card in a board column: title, agent, branch, live state. The
+/// whole card is the drag handle; double-click opens the editor.
+/// What the board knows about a card's running agent tab right now.
+struct KanbanLiveStatus: Equatable {
+    var state: AgentMonitor.State
+    /// The tab's title — cwd, running command, or the agent's own OSC title.
+    var tabTitle: String
+    /// True when this tab is the one the window's pane host is showing.
+    var isWatched: Bool
+}
+
+struct KanbanCardView: View {
+    let card: KanbanCard
+    /// Live agent state when the card's launched tab is still open; nil
+    /// when nothing is running for it.
+    let live: KanbanLiveStatus?
+    let isLaunching: Bool
+    let onOpen: () -> Void
+    /// Single click on a launched card: show its tab (split board, or
+    /// jump to it in another window).
+    let onWatch: () -> Void
+    let onReveal: () -> Void
+    /// In Progress without a live tab: start the agent again.
+    let onRelaunch: () -> Void
+    /// No live tab but a saved conversation: reopen it in a new tab.
+    let onReopen: () -> Void
+    let onMove: (KanbanColumn) -> Void
+    let onDelete: () -> Void
+    /// Entry in the board's archive section: read-only — no drag, no move,
+    /// no delete, single click does nothing; the menu offers "restore".
+    var isArchived: Bool = false
+    /// Done card: take it off the board. nil hides the menu entry.
+    var onArchive: (() -> Void)? = nil
+    /// Archived card: back to Done.
+    var onUnarchive: (() -> Void)? = nil
+
+    @State private var isHovered = false
+
+    private var bundle: Bundle { .kookyResources }
+
+    private var agent: AgentTemplate? {
+        AgentTemplate.all.first { $0.id == card.agentId }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                Text(card.title.isEmpty ? String(localized: "Untitled", bundle: bundle) : card.title)
+                    .font(Theme.display(13, weight: .medium))
+                    .foregroundStyle(Theme.chromeForeground)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+                if live != nil {
+                    terminalBadge
+                } else if card.conversationId != nil, !isLaunching {
+                    reopenBadge
+                } else {
+                    statusDot
+                }
+            }
+            if !card.requirement.isEmpty {
+                Text(singleLine(card.requirement))
+                    .font(Theme.mono(10.5))
+                    .foregroundStyle(Theme.chromeMuted)
+                    .lineLimit(2)
+            }
+            HStack(spacing: 6) {
+                if let agent {
+                    AgentIconView(asset: agent.iconAsset, fallbackSymbol: agent.symbol, size: 14)
+                    Text(agent.title)
+                        .font(Theme.mono(10.5))
+                        .foregroundStyle(Theme.chromeMuted)
+                        .lineLimit(1)
+                } else {
+                    Image(systemName: "questionmark.circle")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.activityFailure)
+                    Text(card.agentId)
+                        .font(Theme.mono(10.5))
+                        .foregroundStyle(Theme.activityFailure)
+                }
+                if let model = card.model, !model.isEmpty {
+                    Text(model)
+                        .font(Theme.mono(9.5))
+                        .foregroundStyle(Theme.chromeMuted.opacity(0.8))
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .bracketBorder()
+                }
+                Spacer(minLength: 0)
+                if !card.attachments.isEmpty {
+                    HStack(spacing: 2) {
+                        Image(systemName: "paperclip")
+                            .font(.system(size: 9))
+                        Text("\(card.attachments.count)")
+                    }
+                    .font(Theme.mono(9.5))
+                    .foregroundStyle(Theme.chromeMuted.opacity(0.7))
+                    .help(card.attachments.map(KanbanCard.attachmentFileName).joined(separator: "\n"))
+                }
+                Text("\(card.effectiveCriteria.count) AC")
+                    .font(Theme.mono(9.5))
+                    .foregroundStyle(Theme.chromeMuted.opacity(0.7))
+                if isArchived {
+                    Text(String(localized: "archived", bundle: bundle))
+                        .font(Theme.mono(9.5))
+                        .foregroundStyle(Theme.chromeMuted.opacity(0.8))
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .bracketBorder()
+                }
+            }
+            if card.column != .backlog || !card.branchName.isEmpty {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 9))
+                    Text(card.branchName)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .font(Theme.mono(10))
+                .foregroundStyle(Theme.chromeMuted.opacity(0.8))
+            }
+            if card.column == .inProgress || live != nil {
+                liveRow
+            }
+            if !card.isReady, card.column == .backlog {
+                Text(card.readinessIssues
+                    .map { String(localized: String.LocalizationValue($0), bundle: bundle) }
+                    .joined(separator: " · "))
+                    .font(Theme.mono(9.5))
+                    .foregroundStyle(Theme.activityAttention.opacity(0.9))
+                    .lineLimit(2)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(isHovered ? Theme.chromeHover : Theme.chromeActive.opacity(0.35))
+        .opacity(isArchived ? 0.7 : 1)
+        .bracketBorder()
+        .overlay {
+            if live?.isWatched == true {
+                Rectangle().stroke(Theme.activityRunning.opacity(0.7), lineWidth: 1)
+            }
+        }
+        .contentShape(Rectangle())
+        .onHover { isHovered = $0 }
+        // Double-click wins: the single click only fires once the
+        // double-click interval has passed without a second click, so
+        // opening the editor never also relaunches or reopens the agent.
+        .gesture(
+            TapGesture(count: 2).onEnded(onOpen)
+                .exclusively(before: TapGesture().onEnded(handleSingleClick))
+        )
+        .contextMenu { contextMenu }
+        .help(isArchived
+              ? String(localized: "Archived · double-click to view", bundle: bundle)
+              : live != nil
+              ? String(localized: "Click to show the terminal · double-click to edit", bundle: bundle)
+              : String(localized: "Double-click to edit", bundle: bundle))
+        // One VoiceOver element per card: its texts read as one label, the
+        // default action edits, the context-menu verbs are custom actions.
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction(.default, onOpen)
+        .accessibilityActions { accessibilityMenu }
+    }
+
+    /// Single click: show the running terminal, or bring the agent back
+    /// when the tab is gone. Archived cards only respond to double-click.
+    private func handleSingleClick() {
+        guard !isArchived else { return }
+        if live != nil {
+            onWatch()
+        } else if card.conversationId != nil, !isLaunching {
+            onReopen()
+        } else if card.column == .inProgress, !isLaunching {
+            onRelaunch()
+        }
+    }
+
+    /// The context menu's verbs as VoiceOver custom actions — plain
+    /// buttons only, which is what `accessibilityActions` accepts.
+    @ViewBuilder
+    private var accessibilityMenu: some View {
+        if isArchived {
+            Button(String(localized: "Restore to Done", bundle: bundle)) { onUnarchive?() }
+        } else {
+            if live != nil {
+                Button(String(localized: "Watch Agent", bundle: bundle), action: onWatch)
+                Button(String(localized: "Open Agent Tab", bundle: bundle), action: onReveal)
+            }
+            if live == nil, card.conversationId != nil, !isLaunching {
+                Button(String(localized: "Reopen Conversation", bundle: bundle), action: onReopen)
+            }
+            if card.column == .inProgress, live == nil, !isLaunching {
+                Button(String(localized: "Relaunch Agent", bundle: bundle), action: onRelaunch)
+            }
+            if card.column == .done, let onArchive {
+                Button(String(localized: "Archive Card", bundle: bundle), action: onArchive)
+            }
+            Button(String(localized: "Delete Card", bundle: bundle), action: onDelete)
+        }
+    }
+
+    /// Top-right "a terminal is open for this card" mark — shown in every
+    /// column while the tab exists, tinted by the agent's state, filled
+    /// when that tab is the one on screen.
+    private var terminalBadge: some View {
+        let tint = live.map { color(for: $0.state) } ?? Theme.chromeMuted
+        return HStack(spacing: 4) {
+            Image(systemName: live?.isWatched == true ? "terminal.fill" : "terminal")
+                .font(.system(size: 10, weight: .medium))
+            Circle()
+                .fill(tint)
+                .frame(width: 6, height: 6)
+        }
+        .foregroundStyle(live?.isWatched == true ? Theme.activityRunning : Theme.chromeForeground.opacity(0.85))
+        .padding(.horizontal, 5)
+        .padding(.vertical, 3)
+        .background(tint.opacity(0.12))
+        .bracketBorder()
+        .help(String.localizedStringWithFormat(
+            String(localized: "Terminal open — %@ · click the card to show it", bundle: bundle),
+            live?.state.label ?? ""
+        ))
+        .accessibilityLabel(String.localizedStringWithFormat(
+            String(localized: "Terminal open — %@", bundle: bundle),
+            live?.state.label ?? ""
+        ))
+    }
+
+    /// The tab is gone but the agent's conversation is on disk: a muted
+    /// terminal mark with a reopen arrow; click brings the conversation
+    /// back in a new tab.
+    private var reopenBadge: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "terminal")
+                .font(.system(size: 10, weight: .medium))
+            Image(systemName: "arrow.counterclockwise")
+                .font(.system(size: 8, weight: .semibold))
+        }
+        .foregroundStyle(Theme.chromeMuted)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 3)
+        .bracketBorder()
+        .help(String(localized: "Terminal closed — conversation saved · click the card to reopen it", bundle: bundle))
+        .accessibilityLabel(String(localized: "Terminal closed — conversation saved", bundle: bundle))
+    }
+
+    /// "● running · 12 min · make test" — the line that answers "is it
+    /// doing something?" without opening the tab.
+    @ViewBuilder
+    private var liveRow: some View {
+        HStack(spacing: 6) {
+            if let live {
+                Circle().fill(color(for: live.state)).frame(width: 6, height: 6)
+                Text(live.state.label)
+                    .foregroundStyle(color(for: live.state))
+                if let launchedAt {
+                    // `.relative` keeps itself current — the card otherwise
+                    // has no reason to re-render while the agent runs.
+                    Text("· \(Text(launchedAt, style: .relative))")
+                        .foregroundStyle(Theme.chromeMuted.opacity(0.8))
+                }
+                Text("· \(live.tabTitle)")
+                    .foregroundStyle(Theme.chromeMuted)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 4)
+                Image(systemName: live.isWatched ? "eye.fill" : "eye")
+                    .foregroundStyle(live.isWatched ? Theme.activityRunning : Theme.chromeMuted.opacity(0.7))
+                    .help(String(localized: "Click the card to watch the agent's terminal", bundle: bundle))
+            } else if isLaunching {
+                ProgressView().controlSize(.mini)
+                Text(String(localized: "starting…", bundle: bundle))
+                    .foregroundStyle(Theme.chromeMuted)
+            } else {
+                Circle().stroke(Theme.chromeMuted, lineWidth: 1).frame(width: 6, height: 6)
+                Text(card.conversationId != nil
+                     ? String(localized: "terminal closed · click to reopen the conversation", bundle: bundle)
+                     : String(localized: "no live agent tab", bundle: bundle))
+                    .foregroundStyle(Theme.chromeMuted.opacity(0.8))
+            }
+        }
+        .font(Theme.mono(10))
+    }
+
+    /// Timestamp of the last `launched …` event, for the running-time label.
+    private var launchedAt: Date? {
+        card.events.last(where: { $0.message.hasPrefix("launched") })?.timestamp
+    }
+
+    @ViewBuilder
+    private var statusDot: some View {
+        if isLaunching {
+            ProgressView()
+                .controlSize(.mini)
+        } else if let live {
+            Circle()
+                .fill(color(for: live.state))
+                .frame(width: 8, height: 8)
+                .help(live.state.label)
+                .accessibilityLabel(live.state.label)
+        } else if card.column == .inProgress {
+            // Card says running, but no live tab backs it (app relaunch,
+            // tab closed): show a hollow dot so the gap is visible.
+            Circle()
+                .stroke(Theme.chromeMuted, lineWidth: 1)
+                .frame(width: 8, height: 8)
+                .help(String(localized: "no live agent tab", bundle: bundle))
+                .accessibilityLabel(String(localized: "no live agent tab", bundle: bundle))
+        }
+    }
+
+    private func color(for state: AgentMonitor.State) -> Color {
+        switch state {
+        case .attention: return Theme.activityAttention
+        case .failed: return Theme.activityFailure
+        case .running: return Theme.activityRunning
+        case .idle: return Theme.chromeMuted
+        }
+    }
+
+    @ViewBuilder
+    private var contextMenu: some View {
+        if isArchived {
+            Button(String(localized: "View…", bundle: bundle)) { onOpen() }
+            Divider()
+            Button(String(localized: "Restore to Done", bundle: bundle)) { onUnarchive?() }
+        } else {
+            liveContextMenu
+        }
+    }
+
+    @ViewBuilder
+    private var liveContextMenu: some View {
+        Button(String(localized: "Edit…", bundle: bundle)) { onOpen() }
+        if live != nil {
+            Button(String(localized: "Watch Agent", bundle: bundle)) { onWatch() }
+            Button(String(localized: "Open Agent Tab", bundle: bundle)) { onReveal() }
+        }
+        if live == nil, card.conversationId != nil, !isLaunching {
+            Button(String(localized: "Reopen Conversation", bundle: bundle)) { onReopen() }
+        }
+        if card.column == .inProgress, live == nil, !isLaunching {
+            Button(String(localized: "Relaunch Agent", bundle: bundle)) { onRelaunch() }
+        }
+        Divider()
+        Menu(String(localized: "Move to", bundle: bundle)) {
+            ForEach(KanbanColumn.allCases, id: \.self) { column in
+                Button(column.title) { onMove(column) }
+                    .disabled(column == card.column)
+            }
+        }
+        Divider()
+        if card.column == .done, let onArchive {
+            Button(String(localized: "Archive Card", bundle: bundle)) { onArchive() }
+        }
+        Button(String(localized: "Delete Card", bundle: bundle), role: .destructive) { onDelete() }
+    }
+}

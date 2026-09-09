@@ -120,18 +120,23 @@ struct SidebarView: View {
                 // Backstop: ⌘⌃S mid-drag unmounts the handle before onEnded
                 // can fire — end the captured engines so the suspension
                 // refcount stays balanced (mirrors the split divider).
+                resizeDragStartWidth = nil
                 if sidebarResizeSuspended {
                     sidebarResizeSuspended = false
                     for engine in sidebarSuspendedEngines { engine.endSizePropagationSuspension() }
                     sidebarSuspendedEngines = []
                 }
+                store.endSidebarResize()
             }
     }
 
     private var resizeGesture: some Gesture {
-        DragGesture(minimumDistance: 0)
+        DragGesture(minimumDistance: 0, coordinateSpace: .global)
             .onChanged { value in
-                if resizeDragStartWidth == nil { resizeDragStartWidth = store.sidebarWidth }
+                if resizeDragStartWidth == nil {
+                    resizeDragStartWidth = store.sidebarWidth
+                    store.beginSidebarResize()
+                }
                 let proposed = (resizeDragStartWidth ?? store.sidebarWidth) + value.translation.width
                 let clamped = Self.clampWidth(proposed)
                 guard abs(clamped - store.sidebarWidth) > .ulpOfOne else { return }
@@ -155,6 +160,7 @@ struct SidebarView: View {
                     }
                     sidebarSuspendedEngines = []
                 }
+                store.endSidebarResize()
                 store.flushPersistence()
             }
     }
@@ -513,6 +519,7 @@ struct SidebarView: View {
                             isCompact: isCompact,
                             draggingId: $draggingWorkspaceId,
                             onCreateWorktree: canCreate ? { presentCreateWorktree(workspace) } : nil,
+                            onNewCard: workspace.sshRemoteHost == nil ? { presentNewCard(workspace) } : nil,
                             onGoToSource: goToSource
                         )
                     }
@@ -570,7 +577,8 @@ struct SidebarView: View {
                     toggle: { toggleCollapsed(parent.id) }
                 )
                 : nil,
-            onCreateWorktree: canCreate ? { presentCreateWorktree(parent) } : nil
+            onCreateWorktree: canCreate ? { presentCreateWorktree(parent) } : nil,
+            onNewCard: parent.sshRemoteHost == nil ? { presentNewCard(parent) } : nil
         )
 
         if hasWorktrees && !isCollapsed {
@@ -626,6 +634,15 @@ struct SidebarView: View {
         }
     }
 
+    /// Right-click → "New Kanban Card…". One implementation with the
+    /// command palette's entry: `KanbanLaunchCoordinator.presentNewCard`
+    /// resolves the repo root and hands it to the board.
+    private func presentNewCard(_ workspace: Workspace) {
+        Task { @MainActor in
+            await KanbanLaunchCoordinator.presentNewCard(for: workspace, in: store)
+        }
+    }
+
     private func presentCreateWorktree(_ workspace: Workspace) {
         // Single channel: parking on the store triggers the `.onChange`
         // observer that sets `sheet`. Direct row clicks and command-palette
@@ -649,6 +666,7 @@ private struct DraggableWorkspaceRow: View {
     /// without this wrapper, so they don't pick up drag/drop handlers.
     var disclosure: SidebarWorkspaceRow.WorktreeDisclosure? = nil
     var onCreateWorktree: (() -> Void)? = nil
+    var onNewCard: (() -> Void)? = nil
     var onGoToSource: (() -> Void)? = nil
 
     @State private var isTargeted = false
@@ -675,6 +693,7 @@ private struct DraggableWorkspaceRow: View {
             onSetTag: { store.setTag($0, for: workspace) },
             disclosure: disclosure,
             onCreateWorktree: onCreateWorktree,
+            onNewCard: onNewCard,
             onGoToSource: onGoToSource
         )
         .dropIndicator(active: isTargeted && !isSelfDrag, on: edge)

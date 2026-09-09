@@ -109,6 +109,8 @@
 "New Tab" = "新建标签页";
 "New Workspace" = "新建工作区";
 "New SSH Workspace…" = "新建 SSH 工作区…";
+"New Kanban Card…" = "新建看板卡片…";
+"card in Backlog for the active workspace" = "为当前工作区在待办列中新建卡片";
 "New Window" = "新建窗口";
 "Quick Open…" = "快速打开…";
 "Open Folder…" = "打开文件夹…";
@@ -294,6 +296,7 @@
 "no sessions found" = "未找到会话";
 "search sessions" = "搜索会话";
 "all" = "全部";
+"only this workspace" = "仅显示当前工作区";
 "untitled" = "未命名";
 "color" = "颜色";
 "no access" = "无访问权限";

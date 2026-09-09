@@ -2,6 +2,27 @@
 
 Notable changes per release. Tagged commits use `vX.Y.Z` shortform.
 
+## v0.51.9 — 2026-09-03
+
+- New: windows come back where you left them. Each window's size and position is restored on the next launch; one whose display is gone lands centered on the main screen at its old size. A new window (⌘⇧N) takes the current window's size. Thanks @kaijianding for the draft implementation. (#75)
+- Fixed: Shift+Enter in Claude Code, pi, omp and other TUI programs now inserts a newline instead of typing a literal `\`. Return is handed to libghostty the way Ghostty does it, so Ctrl+Enter and Option+Enter reach programs as themselves and a `keybind = shift+enter=…` line in your Ghostty config takes effect. The old shell line-continuation shortcut goes with it; add `keybind = shift+enter=text:\\\r` to your Ghostty config to keep it. Thanks @kchen0x for the report and diagnosis. (#72)
+
+## v0.51.8 — 2026-09-02
+
+- Fixed: quitting kooky with ⌘Q while an agent was running no longer turns that tab into a plain terminal on the next launch — the agent comes back and resumes its conversation, as it did before v0.50.1. Thanks @kaijianding for the diagnosis and a draft fix. (#70)
+
+## v0.51.7 — 2026-09-02
+
+- New: the session history panel can be narrowed to the current workspace — tick "only this workspace" under the agent chips to list only conversations that ran inside the active workspace's project (its git repository, or the workspace folder outside git), so a busy machine's history stops burying the project you're in. The agent chips follow the workspace filter, and the header count follows every filter that's active. Thanks @kaijianding for the idea and a draft implementation. (#71)
+
+## v0.51.6 — 2026-09-01
+
+- Fixed: the numeric keypad Enter key now sends Return instead of being ignored. (#67)
+- New: middle-click a tab to close it. (#66)
+- Fixed: resizing the left sidebar no longer makes the terminal jitter, and the right sidebar can be dragged again. (#65)
+- Faster: clicking between tabs now switches immediately, without waiting on the double-click-to-zoom gesture. (#64)
+- Fixed: Ghostty user theme files now load their complete configuration, so settings such as selection and cursor colors take effect. (#68)
+
 ## v0.51.5 — 2026-08-26
 
 - Fixed: a tab opened with `kooky-cli open --no-focus` now actually starts working in the background — the shell (and any `-e` command or agent) runs immediately instead of waiting for the tab to be clicked, while everything the flag promised still holds: kooky stays in the background and what you're looking at doesn't change. Rendering stays paused for hidden tabs, so a busy background tab costs no GPU. (#59)
